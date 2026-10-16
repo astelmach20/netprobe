@@ -1353,9 +1353,19 @@ def cmd_agent(args):
             'StandardErrorPath': log,
         }
         subprocess.run(['launchctl', 'bootout', f'{domain}/{AGENT_LABEL}'], capture_output=True)
+        # bootout returns before the old monitor has exited (it flushes to the database
+        # on SIGTERM); bootstrapping before then fails with "5: Input/output error"
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline and not subprocess.run(
+                ['launchctl', 'print', f'{domain}/{AGENT_LABEL}'], capture_output=True).returncode:
+            time.sleep(0.25)
         with open(AGENT_PLIST, 'wb') as f:
             plistlib.dump(plist, f)
-        r = subprocess.run(['launchctl', 'bootstrap', domain, AGENT_PLIST], capture_output=True, text=True)
+        for attempt in range(5):
+            r = subprocess.run(['launchctl', 'bootstrap', domain, AGENT_PLIST], capture_output=True, text=True)
+            if not r.returncode:
+                break
+            time.sleep(1)
         if r.returncode:
             sys.exit(f'netprobe: launchctl bootstrap failed: {r.stderr.strip()}')
         print(f'Installed {AGENT_PLIST}; monitor runs in the background and at login. Logs: {log}')
