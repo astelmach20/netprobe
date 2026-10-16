@@ -6,10 +6,11 @@ Commands:
             idle and under download/upload/bidirectional load
   monitor   sample the path continuously into a local database
   report    summarize what monitor recorded: timeline, incidents, who to blame
-  agent     install or remove a launchd agent that runs monitor in the background
+  agent     install or remove a background agent that runs monitor
+            (launchd on macOS, systemd --user on Linux)
 
 The path is split into segments so problems can be located:
-  this Mac -> router (Wi-Fi/LAN) -> ISP edge (first hop past the router) -> internet
+  this computer -> router (Wi-Fi/LAN) -> ISP edge (first hop past the router) -> internet
 """
 
 import argparse
@@ -20,6 +21,7 @@ import os
 import plistlib
 import random
 import re
+import select
 import shutil
 import signal
 import socket
@@ -29,6 +31,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
@@ -37,6 +40,12 @@ DB_PATH = os.path.join(DATA_DIR, 'netprobe.db')
 CONFIG_PATH = os.path.join(DATA_DIR, 'config.json')
 AGENT_LABEL = 'com.netprobe.monitor'
 AGENT_PLIST = os.path.expanduser(f'~/Library/LaunchAgents/{AGENT_LABEL}.plist')
+AGENT_UNIT = 'netprobe.service'
+AGENT_UNIT_PATH = os.path.expanduser(f'~/.config/systemd/user/{AGENT_UNIT}')
+
+__version__ = '0.2.0'
+IS_LINUX = sys.platform.startswith('linux')
+THIS_HOST = 'this computer' if IS_LINUX else 'this Mac'
 
 # Apple's networkQuality servers: built for saturation tests, no per-request cap
 LOAD_HOST = 'mensura.cdn-apple.com'
@@ -149,14 +158,42 @@ def run(cmd, timeout=30):
 
 
 def default_route():
+    if IS_LINUX:
+        return linux_default_route()
     out = run(['route', '-n', 'get', 'default'])
     gw = re.search(r'gateway:\s*(\S+)', out)
     iface = re.search(r'interface:\s*(\S+)', out)
     return (gw.group(1) if gw else None), (iface.group(1) if iface else None)
 
 
+def linux_default_route():
+    # `ip` lists routes for the same prefix in metric order, so the first default wins
+    m = re.search(r'^default(?: via (\S+))? dev (\S+)', run(['ip', '-4', 'route', 'show', 'default']), re.M)
+    if m:
+        return m.group(1), m.group(2)
+    # no iproute2 (minimal containers): read the kernel table directly
+    best = None
+    try:
+        with open('/proc/net/route') as f:
+            for line in f.readlines()[1:]:
+                iface, dest, gw, flags, _, _, metric = line.split()[:7]
+                if dest == '00000000' and int(flags, 16) & 0x2 and (best is None or int(metric) < best[0]):
+                    best = (int(metric), socket.inet_ntoa(struct.pack('<I', int(gw, 16))), iface)
+    except (OSError, ValueError):
+        pass
+    return (best[1], best[2]) if best else (None, None)
+
+
 def public_ip():
-    out = run(['curl', '-s', '--max-time', '5', f'https://{INTERNET_ANCHOR}/cdn-cgi/trace'], timeout=10)
+    url = f'https://{INTERNET_ANCHOR}/cdn-cgi/trace'
+    if shutil.which('curl'):
+        out = run(['curl', '-s', '--max-time', '5', url], timeout=10)
+    else:  # minimal Linux installs
+        try:
+            with urllib.request.urlopen(url, timeout=5) as resp:
+                out = resp.read().decode()
+        except (OSError, ValueError):
+            out = ''
     m = re.search(r'^ip=(\S+)', out, re.M)
     return m.group(1) if m else None
 
@@ -167,19 +204,51 @@ def find_isp_hop(gateway):
     Skips the gateway's own WAN address (it shows up as a hop on many ISP
     gateways) and private home-router ranges (double NAT)."""
     skip = {gateway, INTERNET_ANCHOR, public_ip()}
-    # ICMP traceroute, so the hop count matches the path our ICMP probes take
-    out = run(['traceroute', '-I', '-n', '-m', '10', '-q', '1', '-w', '1', INTERNET_ANCHOR], timeout=30)
-    for line in out.splitlines():
-        m = re.match(r'\s*(\d+)\s+(\d+\.\d+\.\d+\.\d+)', line)
-        if not m or m.group(2) in skip:
+    for hop, ip in trace_hops(INTERNET_ANCHOR):
+        if ip in skip or re.match(r'192\.168\.|172\.(1[6-9]|2\d|3[01])\.', ip):
             continue
-        if re.match(r'192\.168\.|172\.(1[6-9]|2\d|3[01])\.', m.group(2)):
-            continue
-        return m.group(2), int(m.group(1))
+        return ip, hop
     return None, None
 
 
+def trace_hops(dest, max_hops=10):
+    """[(hop number, router ip)] along the ICMP path to dest."""
+    if IS_LINUX:
+        # Linux traceroute needs root for ICMP mode (and often isn't installed),
+        # so walk the TTLs over our own unprivileged ping socket
+        return linux_icmp_trace(dest, max_hops)
+    # ICMP traceroute, so the hop count matches the path our ICMP probes take
+    out = run(['traceroute', '-I', '-n', '-m', str(max_hops), '-q', '1', '-w', '1', dest], timeout=30)
+    return [(int(m.group(1)), m.group(2)) for line in out.splitlines()
+            if (m := re.match(r'\s*(\d+)\s+(\d+\.\d+\.\d+\.\d+)', line))]
+
+
+def linux_icmp_trace(dest, max_hops, timeout=2.0):
+    sock = icmp_socket()
+    hops, reached = {}, None
+    try:
+        for ttl in range(1, max_hops + 1):
+            sock.setsockopt(socket.IPPROTO_IP, socket.IP_TTL, ttl)
+            try:
+                icmp_send(sock, echo_packet(0, ttl), dest)
+            except OSError:
+                return []
+        deadline = time.monotonic() + timeout
+        while reached is None and (left := deadline - time.monotonic()) > 0:
+            select.select([sock], [], [], left)
+            for seq, _, src, ttl_exceeded in linux_icmp_read(sock):
+                if ttl_exceeded:
+                    hops[seq] = src
+                elif src == dest:
+                    reached = seq
+    finally:
+        sock.close()
+    return sorted((h, ip) for h, ip in hops.items() if reached is None or h < reached)
+
+
 def dns_servers():
+    if IS_LINUX:
+        return linux_dns_servers()
     servers = []
     for m in re.finditer(r'nameserver\[\d+\]\s*:\s*(\S+)', run(['scutil', '--dns'])):
         if m.group(1) not in servers:
@@ -187,7 +256,28 @@ def dns_servers():
     return servers
 
 
-def wifi_info():
+def linux_dns_servers():
+    def nameservers(path):
+        try:
+            with open(path) as f:
+                return re.findall(r'^\s*nameserver\s+(\S+)', f.read(), re.M)
+        except OSError:
+            return []
+
+    servers = nameservers('/etc/resolv.conf')
+    if servers and all(s.startswith('127.') for s in servers):
+        # systemd-resolved stub (127.0.0.53): ask it for the real upstream servers
+        upstream = []
+        for line in run(['resolvectl', 'dns']).splitlines():
+            upstream += [s.split('#')[0] for s in line.partition(':')[2].split()]  # 1.1.1.1#cloudflare-dns.com
+        servers = upstream or nameservers('/run/systemd/resolve/resolv.conf') or servers
+    return list(dict.fromkeys(servers))
+
+
+def wifi_info(iface=None):
+    """Current Wi-Fi link, or None. iface is the default-route interface (used on Linux)."""
+    if IS_LINUX:
+        return linux_wifi_info(iface)
     out = run(['system_profiler', 'SPAirPortDataType', '-json'], timeout=30)
     try:
         interfaces = json.loads(out)['SPAirPortDataType'][0]['spairport_airport_interfaces']
@@ -207,6 +297,35 @@ def wifi_info():
             'noise': int(m.group(2)) if m else None,
         }
     return None
+
+
+def linux_wifi_info(iface):
+    if not iface or not shutil.which('iw'):
+        return None
+    out = run(['iw', 'dev', iface, 'link'])
+    if not out.startswith('Connected'):
+        return None
+    sig = re.search(r'signal:\s*(-?\d+)', out)
+    freq = re.search(r'freq:\s*(\d+)', out)
+    tx = re.search(r'tx bitrate:\s*([\d.]+) MBit/s(.*)', out)
+    flags = tx.group(2) if tx else ''
+    phy = next((name for tag, name in (('EHT', '802.11be'), ('HE-', '802.11ax'), ('VHT', '802.11ac'), ('MCS', '802.11n'))
+                if tag in flags), None)
+    channel = None
+    if freq:
+        f = int(freq.group(1))
+        band, ch = ('2.4GHz', 14 if f == 2484 else (f - 2407) // 5) if f < 3000 else \
+                   ('5GHz', (f - 5000) // 5) if f < 5925 else ('6GHz', (f - 5950) // 5)
+        width = re.search(r'(\d+)MHz', flags)
+        channel = f'{ch} ({band}, {width.group(1) if width else 20}MHz)'
+    return {
+        'interface': iface,
+        'phy': phy or 'legacy',
+        'channel': channel,
+        'rate': round(float(tx.group(1))) if tx else None,
+        'rssi': int(sig.group(1)) if sig else None,
+        'noise': None,  # iw doesn't report the noise floor
+    }
 
 
 def resolve(host):
@@ -286,6 +405,93 @@ def icmp_checksum(data):
     return ~s & 0xFFFF
 
 
+def echo_packet(ident, seq):
+    payload = b'netprobe' + bytes(24)
+    header = struct.pack('!BBHHH', 8, 0, 0, ident, seq)
+    return struct.pack('!BBHHH', 8, 0, icmp_checksum(header + payload), ident, seq) + payload
+
+
+IP_RECVERR = getattr(socket, 'IP_RECVERR', 11)
+MSG_ERRQUEUE = getattr(socket, 'MSG_ERRQUEUE', 0x2000)
+
+
+def icmp_socket():
+    """Unprivileged ICMP echo socket. On Linux it is non-blocking and reports
+    ICMP errors (TTL exceeded) through its error queue; see linux_icmp_read."""
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_ICMP)
+    except OSError as e:
+        sys.exit(icmp_help(e))
+    if IS_LINUX:
+        sock.setsockopt(socket.IPPROTO_IP, IP_RECVERR, 1)
+        sock.setblocking(False)
+    return sock
+
+
+def icmp_send(sock, packet, host):
+    for attempt in range(3):
+        try:
+            return sock.sendto(packet, (host, 0))
+        except OSError:
+            # Linux hands an earlier probe's ICMP error (e.g. TTL exceeded) to the next
+            # send and drops that packet; the error itself is still on the error queue
+            if not IS_LINUX or attempt == 2:
+                raise
+
+
+def icmp_help(err):
+    msg = f'netprobe: cannot open an unprivileged ICMP socket ({err.strerror or err}).'
+    if not IS_LINUX:
+        return msg
+    try:
+        with open('/proc/sys/net/ipv4/ping_group_range') as f:
+            current = ' '.join(f.read().split())
+    except OSError:
+        current = 'unknown'
+    groups = ', '.join(str(g) for g in sorted({os.getgid(), *os.getgroups()}))
+    return (f'{msg}\n'
+            f'Linux allows ping sockets only for groups in net.ipv4.ping_group_range (now "{current}"; '
+            f'your groups: {groups}).\n'
+            "Allow all groups (most distributions already default to this):\n"
+            "  sudo sysctl -w net.ipv4.ping_group_range='0 2147483647'\n"
+            'Keep it across reboots:\n'
+            "  echo 'net.ipv4.ping_group_range = 0 2147483647' | sudo tee /etc/sysctl.d/60-netprobe.conf")
+
+
+def linux_icmp_read(sock):
+    """Drain a Linux ping socket: [(seq, ident, source ip, ttl_exceeded)].
+
+    Linux differs from macOS here: replies come without the IP header, the
+    kernel rewrites the echo ident to the socket's local port (and only delivers
+    replies carrying it), and TTL-exceeded errors arrive on the error queue with
+    the router's address in the ancillary data rather than as normal packets."""
+    out = []
+    while True:
+        try:
+            data, anc, _, _ = sock.recvmsg(512, 512, MSG_ERRQUEUE)
+        except OSError:  # queue empty
+            break
+        for level, kind, cdata in anc:
+            # struct sock_extended_err, then the offending router's sockaddr_in
+            if level != socket.IPPROTO_IP or kind != IP_RECVERR or len(cdata) < 24 or len(data) < 8:
+                continue
+            _, origin, icmp_type = struct.unpack_from('=IBB', cdata)
+            if origin == 2 and icmp_type == 11:  # SO_EE_ORIGIN_ICMP, time exceeded
+                _, _, _, ident, seq = struct.unpack('!BBHHH', data[:8])  # our echo, as quoted by the router
+                out.append((seq, ident, socket.inet_ntoa(cdata[20:24]), True))
+    while True:
+        try:
+            data, addr = sock.recvfrom(2048)
+        except OSError:  # nothing left, or a pending socket error (already drained above)
+            break
+        offset = ip_header_len(data)
+        if len(data) >= offset + 8:
+            kind, _, _, ident, seq = struct.unpack('!BBHHH', data[offset:offset + 8])
+            if kind == 0:
+                out.append((seq, ident, addr[0], False))
+    return out
+
+
 class Prober:
     """Pings each target on its own interval: ICMP echo over an unprivileged
     datagram socket, or a timed TCP handshake for hosts that drop ICMP."""
@@ -298,8 +504,9 @@ class Prober:
         self._pending = {}  # seq -> (name, ip, sent_monotonic, sent_wall)
         self._ident = os.getpid() & 0xFFFF
         self._seq = random.randrange(0x10000)
-        self._sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_ICMP)
-        self._sock.settimeout(0.2)
+        self._sock = icmp_socket()
+        if not IS_LINUX:
+            self._sock.settimeout(0.2)
         self._tcp_pool = ThreadPoolExecutor(max_workers=8)
         self._threads = [threading.Thread(target=self._send_loop, daemon=True),
                          threading.Thread(target=self._recv_loop, daemon=True)]
@@ -338,12 +545,9 @@ class Prober:
         with self._lock:
             self._seq = seq = (self._seq + 1) & 0xFFFF
             self._pending[seq] = (t.name, t.host, time.monotonic(), time.time())
-        payload = b'netprobe' + bytes(24)
-        header = struct.pack('!BBHHH', 8, 0, 0, self._ident, seq)
-        packet = struct.pack('!BBHHH', 8, 0, icmp_checksum(header + payload), self._ident, seq) + payload
         try:
             self._sock.setsockopt(socket.IPPROTO_IP, socket.IP_TTL, t.ttl or 64)
-            self._sock.sendto(packet, (INTERNET_ANCHOR if t.ttl else t.host, 0))
+            icmp_send(self._sock, echo_packet(self._ident, seq), INTERNET_ANCHOR if t.ttl else t.host)
         except OSError:  # no route, interface down: count as lost
             with self._lock:
                 entry = self._pending.pop(seq, None)
@@ -351,6 +555,8 @@ class Prober:
                 self.on_sample(entry[3], entry[0], None)
 
     def _recv_loop(self):
+        if IS_LINUX:
+            return self._recv_loop_linux()
         while not self._stop.is_set():
             try:
                 data, addr = self._sock.recvfrom(2048)
@@ -377,13 +583,27 @@ class Prober:
                 kind = 0 if kind == 8 else kind
             if kind != 0 or ident != self._ident:
                 continue
-            with self._lock:
-                entry = self._pending.get(seq)
-                # ISP hops are often load-balanced pairs, so any router at that TTL counts
-                if not entry or (not ttl_reply and entry[1] != addr[0]):
-                    continue
-                del self._pending[seq]
-            self.on_sample(entry[3], entry[0], (now - entry[2]) * 1000)
+            self._match(seq, addr[0], ttl_reply, now)
+
+    def _recv_loop_linux(self):
+        while not self._stop.is_set():
+            try:
+                select.select([self._sock], [], [], 0.2)
+            except (OSError, ValueError):  # socket closed by stop()
+                return
+            now = time.monotonic()
+            # the kernel already filtered on ident (it rewrote ours to the socket's port)
+            for seq, _, src, ttl_reply in linux_icmp_read(self._sock):
+                self._match(seq, src, ttl_reply, now)
+
+    def _match(self, seq, src, ttl_reply, now):
+        with self._lock:
+            entry = self._pending.get(seq)
+            # ISP hops are often load-balanced pairs, so any router at that TTL counts
+            if not entry or (not ttl_reply and entry[1] != src):
+                return
+            del self._pending[seq]
+        self.on_sample(entry[3], entry[0], (now - entry[2]) * 1000)
 
     def _expire(self, now):
         with self._lock:
@@ -564,12 +784,13 @@ def print_connection(iface, wifi, gateway, isp, dns):
     print(bold('\nConnection'))
     if wifi:
         snr = wifi['rssi'] - wifi['noise'] if wifi['rssi'] is not None and wifi['noise'] is not None else None
-        signal = f'{wifi["rssi"]} dBm, SNR {snr} dB' if snr is not None else 'signal unknown'
+        signal = f'{wifi["rssi"]} dBm, SNR {snr} dB' if snr is not None else \
+                 f'{wifi["rssi"]} dBm' if wifi['rssi'] is not None else 'signal unknown'
         print(f'  {iface}  Wi-Fi {wifi["phy"]}, channel {wifi["channel"]}, {signal}, link {wifi["rate"]} Mbps')
     else:
         print(f'  {iface}  wired or non-Wi-Fi interface')
     hops = [f'router {gateway}', f'ISP edge {isp}' if isp else dim('ISP edge not found'), f'internet {INTERNET_ANCHOR}']
-    print(f'  path   this Mac → {" → ".join(hops)}')
+    print(f'  path   {THIS_HOST} → {" → ".join(hops)}')
     print(f'  DNS    {", ".join(dns) or "unknown"}')
 
 
@@ -610,7 +831,7 @@ def print_latency_table(targets, phases, stats):
 
 
 LOCATIONS = {
-    'local': 'between this Mac and the router (Wi-Fi or the router itself)',
+    'local': f'between {THIS_HOST} and the router (Wi-Fi or the router itself)',
     'access': "between your router and the ISP's network (your modem's queue or the access line)",
     'upstream': "past your router (your modem's queue, the access line or the ISP; no ISP hop answered to narrow it down)",
     'beyond': "past the first ISP router (congestion in the ISP's network or further upstream)",
@@ -634,16 +855,19 @@ def diagnose(stats, phases, wifi, throughput, dest_names, have_isp):
     idle_net, idle_gw = get('internet', 'idle'), get('gateway', 'idle')
     idle_isp = get('isp', 'idle') if have_isp else None
 
-    if wifi and wifi['rssi'] is not None and wifi['noise'] is not None:
-        rssi, snr = wifi['rssi'], wifi['rssi'] - wifi['noise']
+    if wifi and wifi['rssi'] is not None:
+        # Linux (iw) reports no noise floor, so judge on signal strength alone there
+        rssi = wifi['rssi']
+        snr = rssi - wifi['noise'] if wifi['noise'] is not None else math.inf
+        reading = f'{rssi} dBm, SNR {snr} dB' if wifi['noise'] is not None else f'{rssi} dBm'
         if rssi < -70 or snr < 20:
-            findings.append(('bad', f'Weak Wi-Fi signal ({rssi} dBm, SNR {snr} dB)',
+            findings.append(('bad', f'Weak Wi-Fi signal ({reading})',
                              'Expect retries, jitter and lower speed. Move closer to the router, remove obstructions, or use Ethernet.'))
         elif rssi < -65 or snr < 25:
-            findings.append(('warn', f'Fair Wi-Fi signal ({rssi} dBm, SNR {snr} dB)',
+            findings.append(('warn', f'Fair Wi-Fi signal ({reading})',
                              'Usable, but a few metres or a wall away from trouble.'))
         else:
-            findings.append(('ok', f'Strong Wi-Fi signal ({rssi} dBm, SNR {snr} dB)', None))
+            findings.append(('ok', f'Strong Wi-Fi signal ({reading})', None))
 
     if idle_gw and idle_gw.p50 is not None:
         if idle_gw.p50 > 10 or idle_gw.jitter > 5 or idle_gw.loss_pct >= 1:
@@ -742,10 +966,11 @@ def cmd_check(args):
     gateway, iface = default_route()
     if not gateway:
         sys.exit('netprobe: no default route; you appear to be offline.')
+    icmp_socket().close()  # fail now, with the fix, rather than after path discovery
 
     print(bold('netprobe check'))
     live(dim('  Discovering path…'))
-    wifi = wifi_info()
+    wifi = wifi_info(iface)
     if wifi and wifi['interface'] != iface:
         wifi = None
     isp, isp_hop = find_isp_hop(gateway)
@@ -823,14 +1048,15 @@ def cmd_monitor(args):
         dests = [Target(h, ip, 'tcp', args.interval * 10) for h in cfg['destinations'] if (ip := resolve(h))]
         return path_targets(gateway, isp, isp_hop, args.interval) + dests, isp
 
-    gateway, _ = default_route()
+    gateway, iface = default_route()
+    icmp_socket().close()  # exit with the fix if ICMP is not allowed
     targets, isp = build_targets(gateway)
     db.execute('INSERT INTO events VALUES (?, ?, ?)', (time.time(), 'start', f'gateway={gateway} isp={isp}'))
     db.commit()
     if not args.quiet:
         print(bold('netprobe monitor') + dim(f'  router {gateway}, ISP edge {isp}, writing to {DB_PATH}  (Ctrl-C to stop)'))
 
-    def on_term(signum, frame):  # launchd stops agents with SIGTERM
+    def on_term(signum, frame):  # launchd and systemd stop agents with SIGTERM
         raise KeyboardInterrupt
     signal.signal(signal.SIGTERM, on_term)
     signal.signal(signal.SIGINT, signal.default_int_handler)  # background shells start us with SIGINT ignored
@@ -850,7 +1076,7 @@ def cmd_monitor(args):
                 db.commit()
                 next_flush = now + 5
             if now >= next_route:
-                new_gateway, _ = default_route()
+                new_gateway, iface = default_route()
                 if new_gateway != gateway:
                     gateway = new_gateway
                     targets, isp = build_targets(gateway)
@@ -860,7 +1086,7 @@ def cmd_monitor(args):
                         print(yellow(f'{time.strftime("%H:%M:%S")}  network changed: router {gateway}, ISP edge {isp}'))
                 next_route = now + 30
             if now >= next_wifi:
-                w = wifi_info()
+                w = wifi_info(iface)
                 if w:
                     db.execute('INSERT INTO wifi VALUES (?, ?, ?, ?, ?)', (now, w['rssi'], w['noise'], w['rate'], w['channel']))
                 next_wifi = now + 120
@@ -1096,19 +1322,27 @@ def cmd_report(args):
 
 # ---------------------------------------------------------------- agent
 
+def install_script():
+    """Copy netprobe into ~/.netprobe for the agent to run; returns (python, script, log)."""
+    os.makedirs(DATA_DIR, exist_ok=True)
+    # Run a copy from ~/.netprobe: macOS privacy controls block background jobs from
+    # reading ~/Desktop or ~/Documents, where the checkout often lives, and the
+    # agent keeps working if a pipx install or checkout moves
+    script = os.path.join(DATA_DIR, 'netprobe.py')
+    shutil.copy2(os.path.abspath(__file__), script)
+    # The PATH python3 is a stable symlink; sys.executable can point into a
+    # versioned directory that disappears on the next Homebrew upgrade
+    python = shutil.which('python3') or sys.executable
+    return python, script, os.path.join(DATA_DIR, 'agent.log')
+
+
 def cmd_agent(args):
+    if IS_LINUX:
+        return linux_agent(args)
     domain = f'gui/{os.getuid()}'
     if args.action == 'install':
-        os.makedirs(DATA_DIR, exist_ok=True)
         os.makedirs(os.path.dirname(AGENT_PLIST), exist_ok=True)
-        log = os.path.join(DATA_DIR, 'agent.log')
-        # Run a copy from ~/.netprobe: macOS privacy controls block background jobs from
-        # reading ~/Desktop or ~/Documents, where the checkout often lives
-        script = os.path.join(DATA_DIR, 'netprobe.py')
-        shutil.copy2(os.path.abspath(__file__), script)
-        # The PATH python3 is a stable symlink; sys.executable can point into a
-        # versioned directory that disappears on the next Homebrew upgrade
-        python = shutil.which('python3') or sys.executable
+        python, script, log = install_script()
         plist = {
             'Label': AGENT_LABEL,
             'ProgramArguments': [python, script, 'monitor', '--quiet'],
@@ -1141,10 +1375,58 @@ def cmd_agent(args):
     return 0
 
 
+def linux_agent(args):
+    if not shutil.which('systemctl'):
+        sys.exit('netprobe: the agent needs systemd (systemctl not found). Run `netprobe monitor` under '
+                 'your own supervisor instead.')
+
+    def systemctl(*cmd):
+        return subprocess.run(['systemctl', '--user', *cmd], capture_output=True, text=True)
+
+    if args.action == 'install':
+        python, script, log = install_script()
+        quote = lambda s: '"' + s.replace('\\', '\\\\').replace('"', '\\"') + '"'
+        unit = (
+            '[Unit]\n'
+            'Description=netprobe network monitor\n'
+            'Wants=network-online.target\n'
+            'After=network-online.target\n\n'
+            '[Service]\n'
+            f'ExecStart={quote(python)} {quote(script)} monitor --quiet\n'
+            'Restart=always\n'
+            'RestartSec=10\n'
+            f'StandardOutput=append:{log}\n'
+            f'StandardError=append:{log}\n\n'
+            '[Install]\n'
+            'WantedBy=default.target\n'
+        )
+        os.makedirs(os.path.dirname(AGENT_UNIT_PATH), exist_ok=True)
+        with open(AGENT_UNIT_PATH, 'w') as f:
+            f.write(unit)
+        for cmd in (['daemon-reload'], ['enable', AGENT_UNIT], ['restart', AGENT_UNIT]):
+            r = systemctl(*cmd)
+            if r.returncode:
+                sys.exit(f'netprobe: systemctl --user {" ".join(cmd)} failed: {r.stderr.strip()}')
+        print(f'Installed {AGENT_UNIT_PATH}; monitor runs in the background and at login. Logs: {log}')
+        print(dim(f'The agent runs a copy at {script}; re-run `agent install` after updating netprobe.'))
+        print(dim(f'To keep it running while you are logged out: loginctl enable-linger {os.environ.get("USER", "$USER")}'))
+    elif args.action == 'uninstall':
+        systemctl('disable', '--now', AGENT_UNIT)
+        if os.path.exists(AGENT_UNIT_PATH):
+            os.remove(AGENT_UNIT_PATH)
+        systemctl('daemon-reload')
+        print(f'Removed the agent. Recorded data stays in {DB_PATH}.')
+    else:
+        state = systemctl('is-active', AGENT_UNIT).stdout.strip()
+        print(f'Agent {state}.' if state == 'active' else 'Agent not running.')
+    return 0
+
+
 # ---------------------------------------------------------------- main
 
 def main():
     parser = argparse.ArgumentParser(prog='netprobe', description=__doc__.split('\n')[0])
+    parser.add_argument('--version', action='version', version=f'netprobe {__version__}')
     sub = parser.add_subparsers(dest='command', required=True)
 
     p = sub.add_parser('check', help='one-shot diagnosis, idle and under load')
@@ -1164,11 +1446,13 @@ def main():
     p.add_argument('--limit', type=int, default=20, help='max incidents to list (default 20)')
     p.set_defaults(func=cmd_report)
 
-    p = sub.add_parser('agent', help='run monitor in the background via launchd')
+    p = sub.add_parser('agent', help='run monitor in the background (launchd on macOS, systemd --user on Linux)')
     p.add_argument('action', choices=['install', 'uninstall', 'status'])
     p.set_defaults(func=cmd_agent)
 
     args = parser.parse_args()
+    if args.command != 'report' and sys.platform != 'darwin' and not IS_LINUX:
+        sys.exit(f'netprobe: {args.command} supports macOS and Linux only (this is {sys.platform}).')
     if args.command == 'report':
         try:
             args.since_seconds = parse_duration(args.since)
