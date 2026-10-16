@@ -41,3 +41,7 @@ Data lives in `~/.netprobe/` (database `netprobe.db`, kept 30 days).
 - **Destinations:** timed TCP handshakes to port 443, because many hosts drop ICMP.
 - **Load:** parallel HTTPS streams to Apple's networkQuality servers (`mensura.cdn-apple.com`), the same servers `networkQuality` uses.
 - **Blame:** when latency or loss rises at the internet anchor, the segment that accounts for at least half of the rise gets the blame. A rise at the ISP hop but not at the router means the gateway's queue or the access line (bufferbloat). A rise only past the ISP hop means ISP or upstream congestion.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
