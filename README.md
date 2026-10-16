@@ -2,6 +2,40 @@
 
 Finds where your network is slow, and when. macOS only; one Python file, standard library only, no root needed.
 
+```
+$ ./netprobe.py check
+
+Connection
+  en0  Wi-Fi 802.11ax, channel 69 (6GHz, 160MHz), -54 dBm, SNR 37 dB, link 1152 Mbps
+  path   this Mac → router 192.168.1.1 → ISP edge 203.0.113.1 → internet 1.1.1.1
+  DNS    1.0.0.1, 1.1.1.1
+
+Measuring (~61s): idle, then saturating download, upload, both
+  idle      done
+  download  done  ↓ 233 Mbps
+  upload    done  ↑ 23 Mbps
+  both      done  ↓ 227 Mbps  ↑ 22 Mbps
+
+Latency by segment (ms: median / 95th percentile, loss)
+                            idle              download          upload            both
+  Router (Wi-Fi/LAN)        3.6 / 5.1         4.7 / 7.1         4.1 / 6.7         4.6 / 6.5
+  ISP network               14 / 17           41 / 46           218 / 236         245 / 273
+  Internet (1.1.1.1)        14 / 19           40 / 52           219 / 240         235 / 272
+  zoom.us (tcp)             17 / 25           48 / 67           219 / 238         246 / 272
+
+Findings
+  ✗ Upload: +205 ms under load (grade D)
+    Bufferbloat: the delay builds between your router and the ISP's network (your modem's queue
+    or the access line). Fix: smart queue management (fq_codel/CAKE, "SQM", "Smart Queues") on a
+    router you control, shaped to about 90% of measured speed (upload ~21 Mbps).
+  ! Real apps feel it: connecting to zoom.us took 246 ms during both load vs 17 ms unloaded
+  ✓ Strong Wi-Fi signal (-54 dBm, SNR 37 dB)
+  ✓ Router hop clean (3.6 ms, 0.9 ms jitter)
+  ✓ Download: +27 ms under load (grade A)
+```
+
+The Wi-Fi hop stays at 4 ms while the first ISP router jumps to 218 ms under upload, so the problem is the gateway's upload queue, not Wi-Fi or the ISP.
+
 Speed tests give you one snapshot against one server. netprobe also covers what they leave out:
 
 | Gap in typical testers | What netprobe does |

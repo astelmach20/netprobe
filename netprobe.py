@@ -20,6 +20,7 @@ import os
 import plistlib
 import random
 import re
+import shutil
 import signal
 import socket
 import sqlite3
@@ -1101,9 +1102,16 @@ def cmd_agent(args):
         os.makedirs(DATA_DIR, exist_ok=True)
         os.makedirs(os.path.dirname(AGENT_PLIST), exist_ok=True)
         log = os.path.join(DATA_DIR, 'agent.log')
+        # Run a copy from ~/.netprobe: macOS privacy controls block background jobs from
+        # reading ~/Desktop or ~/Documents, where the checkout often lives
+        script = os.path.join(DATA_DIR, 'netprobe.py')
+        shutil.copy2(os.path.abspath(__file__), script)
+        # The PATH python3 is a stable symlink; sys.executable can point into a
+        # versioned directory that disappears on the next Homebrew upgrade
+        python = shutil.which('python3') or sys.executable
         plist = {
             'Label': AGENT_LABEL,
-            'ProgramArguments': [sys.executable, os.path.abspath(__file__), 'monitor', '--quiet'],
+            'ProgramArguments': [python, script, 'monitor', '--quiet'],
             'RunAtLoad': True,
             'KeepAlive': True,
             'ProcessType': 'Background',
@@ -1117,6 +1125,7 @@ def cmd_agent(args):
         if r.returncode:
             sys.exit(f'netprobe: launchctl bootstrap failed: {r.stderr.strip()}')
         print(f'Installed {AGENT_PLIST}; monitor runs in the background and at login. Logs: {log}')
+        print(dim(f'The agent runs a copy at {script}; re-run `agent install` after updating netprobe.'))
     elif args.action == 'uninstall':
         subprocess.run(['launchctl', 'bootout', f'{domain}/{AGENT_LABEL}'], capture_output=True)
         if os.path.exists(AGENT_PLIST):
