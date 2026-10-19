@@ -43,7 +43,7 @@ AGENT_PLIST = os.path.expanduser(f'~/Library/LaunchAgents/{AGENT_LABEL}.plist')
 AGENT_UNIT = 'netprobe.service'
 AGENT_UNIT_PATH = os.path.expanduser(f'~/.config/systemd/user/{AGENT_UNIT}')
 
-__version__ = '0.2.0'
+__version__ = '0.3.0'
 IS_LINUX = sys.platform.startswith('linux')
 THIS_HOST = 'this computer' if IS_LINUX else 'this Mac'
 
@@ -52,12 +52,17 @@ LOAD_HOST = 'mensura.cdn-apple.com'
 DOWNLOAD_PATH = '/api/v1/gm/large'
 UPLOAD_PATH = '/api/v1/gm/slurp'
 UPLOAD_REQUEST_BYTES = 100_000_000
+# Streams per direction: start small, add a step at a time while throughput still rises
+LOAD_STREAMS, LOAD_STREAMS_MAX = 4, 16
+RAMP_STEP_S, RAMP_MAX_S = 2.0, 8.0
 INTERNET_ANCHOR = '1.1.1.1'
+INTERNET_ANCHOR6 = '2606:4700:4700::1111'
 DEFAULT_DESTINATIONS = ['google.com', 'github.com', 'apple.com', 'zoom.us']
 PROBE_TIMEOUT = 2.0
 RETENTION_DAYS = 30
 
-SEGMENT_LABELS = {'gateway': 'Router (Wi-Fi/LAN)', 'isp': 'ISP network', 'internet': f'Internet ({INTERNET_ANCHOR})'}
+SEGMENT_LABELS = {'gateway': 'Router (Wi-Fi/LAN)', 'isp': 'ISP network', 'internet': f'Internet ({INTERNET_ANCHOR})',
+                  'internet6': 'Internet (IPv6)'}
 PHASES = [('idle', ()), ('download', ('down',)), ('upload', ('up',)), ('both', ('down', 'up'))]
 
 
@@ -184,6 +189,16 @@ def linux_default_route():
     return (best[1], best[2]) if best else (None, None)
 
 
+def local_address():
+    """This computer's IPv4 address on the default route."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect((INTERNET_ANCHOR, 53))  # picks a route and source address; sends nothing
+            return s.getsockname()[0]
+    except OSError:
+        return None
+
+
 def public_ip():
     url = f'https://{INTERNET_ANCHOR}/cdn-cgi/trace'
     if shutil.which('curl'):
@@ -202,10 +217,14 @@ def find_isp_hop(gateway):
     """First ISP router that answers traceroute: (ip, hop number).
 
     Skips the gateway's own WAN address (it shows up as a hop on many ISP
-    gateways) and private home-router ranges (double NAT)."""
+    gateways) and private RFC 1918 hops, which are usually a second home router
+    (double NAT). Some ISPs number their first router in 10/8 too; skipping it
+    only moves the boundary one ISP hop out, while taking a home router for the
+    ISP would blame the access line's queue on the ISP. CGNAT space (100.64/10)
+    is the ISP's and is kept."""
     skip = {gateway, INTERNET_ANCHOR, public_ip()}
     for hop, ip in trace_hops(INTERNET_ANCHOR):
-        if ip in skip or re.match(r'192\.168\.|172\.(1[6-9]|2\d|3[01])\.', ip):
+        if ip in skip or re.match(r'10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.', ip):
             continue
         return ip, hop
     return None, None
@@ -328,6 +347,19 @@ def linux_wifi_info(iface):
     }
 
 
+def ipv6_available():
+    """True with a global IPv6 route and an unprivileged ICMPv6 socket."""
+    try:
+        with socket.socket(socket.AF_INET6, socket.SOCK_DGRAM) as s:
+            s.connect((INTERNET_ANCHOR6, 53))  # picks a route and source address; sends nothing
+            if s.getsockname()[0].lower().startswith('fe80'):
+                return False
+        socket.socket(socket.AF_INET6, socket.SOCK_DGRAM, socket.IPPROTO_ICMPV6).close()
+    except OSError:
+        return False
+    return True
+
+
 def resolve(host):
     try:
         return socket.getaddrinfo(host, 443, socket.AF_INET, socket.SOCK_STREAM)[0][4][0]
@@ -379,7 +411,7 @@ class Target:
     next_at: float = 0.0
 
 
-def path_targets(gateway, isp, isp_hop, interval):
+def path_targets(gateway, isp, isp_hop, interval, ipv6=False):
     targets = []
     if gateway:
         targets.append(Target('gateway', gateway, 'icmp', interval))
@@ -389,6 +421,8 @@ def path_targets(gateway, isp, isp_hop, interval):
         # rate-limit those replies, so probe gently and never trust its loss.
         targets.append(Target('isp', isp, 'icmp', max(interval, 1.0), ttl=isp_hop))
     targets.append(Target('internet', INTERNET_ANCHOR, 'icmp', interval))
+    if ipv6:
+        targets.append(Target('internet6', INTERNET_ANCHOR6, 'icmp', interval))
     return targets
 
 
@@ -405,8 +439,10 @@ def icmp_checksum(data):
     return ~s & 0xFFFF
 
 
-def echo_packet(ident, seq):
+def echo_packet(ident, seq, v6=False):
     payload = b'netprobe' + bytes(24)
+    if v6:  # the kernel fills in the ICMPv6 checksum, which covers an IPv6 pseudo-header
+        return struct.pack('!BBHHH', 128, 0, 0, ident, seq) + payload
     header = struct.pack('!BBHHH', 8, 0, 0, ident, seq)
     return struct.pack('!BBHHH', 8, 0, icmp_checksum(header + payload), ident, seq) + payload
 
@@ -425,6 +461,17 @@ def icmp_socket():
     if IS_LINUX:
         sock.setsockopt(socket.IPPROTO_IP, IP_RECVERR, 1)
         sock.setblocking(False)
+    return sock
+
+
+def icmp6_socket():
+    """Unprivileged ICMPv6 echo socket, or None. IPv6 sockets never deliver the IP
+    header, and Linux rewrites the echo ident here just as for IPv4."""
+    try:
+        sock = socket.socket(socket.AF_INET6, socket.SOCK_DGRAM, socket.IPPROTO_ICMPV6)
+    except OSError:
+        return None
+    sock.setblocking(False)
     return sock
 
 
@@ -507,9 +554,12 @@ class Prober:
         self._sock = icmp_socket()
         if not IS_LINUX:
             self._sock.settimeout(0.2)
+        self._sock6 = icmp6_socket()
         self._tcp_pool = ThreadPoolExecutor(max_workers=8)
         self._threads = [threading.Thread(target=self._send_loop, daemon=True),
                          threading.Thread(target=self._recv_loop, daemon=True)]
+        if self._sock6:
+            self._threads.append(threading.Thread(target=self._recv_loop6, daemon=True))
 
     def start(self):
         for t in self._threads:
@@ -521,6 +571,8 @@ class Prober:
             t.join(timeout=2)
         self._tcp_pool.shutdown(wait=False, cancel_futures=True)
         self._sock.close()
+        if self._sock6:
+            self._sock6.close()
 
     def set_targets(self, targets):
         with self._lock:
@@ -546,8 +598,13 @@ class Prober:
             self._seq = seq = (self._seq + 1) & 0xFFFF
             self._pending[seq] = (t.name, t.host, time.monotonic(), time.time())
         try:
-            self._sock.setsockopt(socket.IPPROTO_IP, socket.IP_TTL, t.ttl or 64)
-            icmp_send(self._sock, echo_packet(self._ident, seq), INTERNET_ANCHOR if t.ttl else t.host)
+            if ':' in t.host:
+                if not self._sock6:
+                    raise OSError('no ICMPv6 socket')
+                self._sock6.sendto(echo_packet(self._ident, seq, v6=True), (t.host, 0))
+            else:
+                self._sock.setsockopt(socket.IPPROTO_IP, socket.IP_TTL, t.ttl or 64)
+                icmp_send(self._sock, echo_packet(self._ident, seq), INTERNET_ANCHOR if t.ttl else t.host)
         except OSError:  # no route, interface down: count as lost
             with self._lock:
                 entry = self._pending.pop(seq, None)
@@ -595,6 +652,25 @@ class Prober:
             # the kernel already filtered on ident (it rewrote ours to the socket's port)
             for seq, _, src, ttl_reply in linux_icmp_read(self._sock):
                 self._match(seq, src, ttl_reply, now)
+
+    def _recv_loop6(self):
+        while not self._stop.is_set():
+            try:
+                select.select([self._sock6], [], [], 0.2)
+            except (OSError, ValueError):  # socket closed by stop()
+                return
+            now = time.monotonic()
+            while True:
+                try:
+                    data, addr = self._sock6.recvfrom(2048)
+                except OSError:  # nothing left, a reported ICMP error, or closed
+                    break
+                if len(data) < 8:
+                    continue
+                kind, _, _, ident, seq = struct.unpack('!BBHHH', data[:8])
+                # macOS hands every ICMPv6 socket every reply; Linux filters on its rewritten ident
+                if kind == 129 and (IS_LINUX or ident == self._ident):
+                    self._match(seq, addr[0].split('%')[0], False, now)
 
     def _match(self, seq, src, ttl_reply, now):
         with self._lock:
@@ -648,11 +724,10 @@ class Collector:
 # ---------------------------------------------------------------- load generation
 
 class Load:
-    """Saturates one direction with parallel HTTPS streams to Cloudflare."""
+    """Saturates one direction with parallel HTTPS streams to Apple's networkQuality servers."""
 
-    def __init__(self, direction, streams=4):
+    def __init__(self, direction):
         self.direction = direction
-        self.streams = streams
         self.bytes = 0
         self.errors = 0
         self.last_error = None
@@ -661,8 +736,15 @@ class Load:
         self._conns = set()
         self._threads = []
 
+    @property
+    def streams(self):
+        return len(self._threads)
+
     def start(self):
-        for _ in range(self.streams):
+        self.add_streams(LOAD_STREAMS)
+
+    def add_streams(self, n):
+        for _ in range(n):
             t = threading.Thread(target=self._run, daemon=True)
             t.start()
             self._threads.append(t)
@@ -746,26 +828,48 @@ class Load:
 # ---------------------------------------------------------------- check
 
 def run_phase(name, directions, duration, collector):
-    """Runs one phase; returns the (t0, t1) sample window and Mbps per direction."""
+    """Runs one phase; returns the (t0, t1) sample window and Mbps per direction.
+
+    A load phase first adds streams until throughput stops rising, since a few
+    streams can't fill a fast line and an unfilled line hides bufferbloat. It
+    then lets the queues fill and measures for the rest of `duration`."""
     loads = [Load(d) for d in directions]
     for load in loads:
         load.start()
     start = time.time()
-    warm = start + (min(3.0, duration / 3) if loads else 0)  # let TCP ramp up and queues fill
+    measure = duration - min(3.0, duration / 3) if loads else duration
+    warm = end = None  # set once the ramp settles
+    if not loads:
+        warm, end = start, start + duration
+    ramp = {l.direction: (start, 0, 0.0) for l in loads}  # step start, bytes then, best Mbps so far
+    ramping = set(ramp)
     marks, last, rates = {}, {l.direction: (start, 0) for l in loads}, {}
     try:
-        while (now := time.time()) < start + duration:
+        while (now := time.time()) < (end or math.inf):
             for l in loads:
                 b, (t0, b0) = l.bytes, last[l.direction]
                 if now - t0 >= 1:
                     rates[l.direction] = (b - b0) * 8 / (now - t0) / 1e6
                     last[l.direction] = (now, b)
-                if now >= warm and l.direction not in marks:
+                if l.direction in ramping and now - ramp[l.direction][0] >= RAMP_STEP_S:
+                    t0, b0, best = ramp[l.direction]
+                    rate = (b - b0) * 8 / (now - t0) / 1e6
+                    if rate > best * 1.1 and l.streams < LOAD_STREAMS_MAX and now < start + RAMP_MAX_S:
+                        l.add_streams(LOAD_STREAMS)
+                        ramp[l.direction] = (now, b, rate)
+                    else:
+                        ramping.discard(l.direction)
+                if warm and now >= warm and l.direction not in marks:
                     marks[l.direction] = (now, b)
+            if warm is None and (not ramping or now >= start + RAMP_MAX_S):
+                warm = now + 1  # let queues fill at the final stream count
+                end = warm + measure
             rate_text = '  '.join(f'{"↓" if d == "down" else "↑"} {r:5.0f} Mbps' for d, r in rates.items())
-            live(f'  {name:<9} {int(now - start):>3}/{duration}s  latency {fmt_ms(collector.latest("internet")):>5} ms  {rate_text}')
+            streams = ' '.join(str(l.streams) for l in loads)
+            when = f'{max(0, int(end - now)):>3}s left' if end else ' ramping'
+            live(f'  {name:<9} {when}  latency {fmt_ms(collector.latest("internet")):>5} ms  {rate_text}'
+                 + (dim(f'  ({streams} streams)') if loads else ''))
             time.sleep(0.25)
-        end = time.time()
         mbps = {l.direction: (l.bytes - marks[l.direction][1]) * 8 / (end - marks[l.direction][0]) / 1e6
                 for l in loads if l.direction in marks and end > marks[l.direction][0]}
     finally:
@@ -780,7 +884,7 @@ def run_phase(name, directions, duration, collector):
     return (warm, end), mbps
 
 
-def print_connection(iface, wifi, gateway, isp, dns):
+def print_connection(iface, wifi, gateway, isp, dns, ipv6):
     print(bold('\nConnection'))
     if wifi:
         snr = wifi['rssi'] - wifi['noise'] if wifi['rssi'] is not None and wifi['noise'] is not None else None
@@ -792,6 +896,7 @@ def print_connection(iface, wifi, gateway, isp, dns):
     hops = [f'router {gateway}', f'ISP edge {isp}' if isp else dim('ISP edge not found'), f'internet {INTERNET_ANCHOR}']
     print(f'  path   {THIS_HOST} → {" → ".join(hops)}')
     print(f'  DNS    {", ".join(dns) or "unknown"}')
+    print(f'  IPv6   {f"yes, probing {INTERNET_ANCHOR6}" if ipv6 else dim("no global IPv6 route")}')
 
 
 def print_app_timings(rows):
@@ -904,6 +1009,23 @@ def diagnose(stats, phases, wifi, throughput, dest_names, have_isp):
                 findings.append(('warn', f'Slow access line (+{fmt_ms(access)} ms from router to ISP)',
                                  'Typical cable/fiber is under 15 ms; DSL, fixed wireless or satellite are slower.'))
 
+    idle_v6 = get('internet6', 'idle')
+    if idle_v6 and idle_net and idle_net.p50 is not None:
+        if idle_v6.p50 is None:
+            findings.append(('bad', 'IPv6 is not answering',
+                             'There is an IPv6 route but no replies over it. Apps try IPv6 first and fall back '
+                             'to IPv4 after a delay, so connections start slowly. Check the router\'s IPv6 settings '
+                             'or turn IPv6 off on it.'))
+        elif idle_v6.loss_pct >= 1:
+            findings.append(('warn', f'{idle_v6.loss_pct:.1f}% IPv6 packet loss at idle (IPv4: {idle_net.loss_pct:.1f}%)',
+                             'Most apps prefer IPv6, so they get the lossy path.'))
+        elif (slower := idle_v6.p50 - idle_net.p50) > 20:
+            findings.append(('warn', f'IPv6 is {fmt_ms(slower)} ms slower than IPv4',
+                             'Most apps prefer IPv6, so they get the slower path. Usually a poor ISP IPv6 route '
+                             'or a tunnel; worth raising with your ISP.'))
+        else:
+            findings.append(('ok', f'IPv6 working ({fmt_ms(idle_v6.p50)} ms vs {fmt_ms(idle_net.p50)} ms over IPv4)', None))
+
     labels = {'download': 'Download', 'upload': 'Upload', 'both': 'Download + upload'}
     for phase in (p for p in phases if p != 'idle'):
         net = get('internet', phase)
@@ -978,12 +1100,13 @@ def cmd_check(args):
     live(dim('  Timing real requests…'))
     app = [(h, curl_timings(h)) for h, _ in dests]
     live('')
-    print_connection(iface, wifi, gateway, isp, dns_servers())
+    ipv6 = ipv6_available()
+    print_connection(iface, wifi, gateway, isp, dns_servers(), ipv6)
     print_app_timings(app)
 
-    targets = path_targets(gateway, isp, isp_hop, interval=0.2) + [Target(h, ip, 'tcp', 1.0) for h, ip in dests]
+    targets = path_targets(gateway, isp, isp_hop, 0.2, ipv6) + [Target(h, ip, 'tcp', 1.0) for h, ip in dests]
     phases = PHASES[:1] if args.no_load else PHASES
-    total = idle_s + (0 if args.no_load else 3 * (load_s + 2))
+    total = f'{idle_s}' if args.no_load else f'{idle_s + 3 * (load_s + 2)}–{idle_s + 3 * (load_s + int(RAMP_MAX_S))}'
     print(bold(f'\nMeasuring (~{total}s){"" if args.no_load else ": idle, then saturating download, upload, both"}'))
 
     collector = Collector()
@@ -1027,30 +1150,41 @@ def open_db():
     return db
 
 
-def cmd_monitor(args):
-    sys.stdout.reconfigure(line_buffering=True)  # status lines reach logs promptly
-    cfg = load_config()
-    db = open_db()
+def prune(db):
     cutoff = time.time() - RETENTION_DAYS * 86400
     for table in ('samples', 'wifi', 'events'):
         db.execute(f'DELETE FROM {table} WHERE ts < ?', (cutoff,))
     db.commit()
 
-    lock, buffer, recent = threading.Lock(), [], []
+
+def cmd_monitor(args):
+    sys.stdout.reconfigure(line_buffering=True)  # status lines reach logs promptly
+    cfg = load_config()
+    db = open_db()
+    prune(db)
+
+    lock, buffer, recent, wifi_rows = threading.Lock(), [], [], []
 
     def on_sample(ts, name, rtt):
         with lock:
             buffer.append((ts, name, rtt))
             recent.append((ts, name, rtt))
 
-    def build_targets(gateway):
+    def build_path(gateway):
         isp, isp_hop = find_isp_hop(gateway) if gateway else (None, None)
-        dests = [Target(h, ip, 'tcp', args.interval * 10) for h in cfg['destinations'] if (ip := resolve(h))]
-        return path_targets(gateway, isp, isp_hop, args.interval) + dests, isp
+        return path_targets(gateway, isp, isp_hop, args.interval, ipv6_available()), isp
+
+    def build_dests():
+        return [Target(h, ip, 'tcp', args.interval * 10) for h in cfg['destinations'] if (ip := resolve(h))]
 
     gateway, iface = default_route()
     icmp_socket().close()  # exit with the fix if ICMP is not allowed
-    targets, isp = build_targets(gateway)
+    # Many networks share a router address like 192.168.1.1, so a change of network
+    # also shows as a new local address or public address. (The router's MAC would be
+    # better, but macOS hides the ARP table from apps without Local Network access.)
+    address, public = local_address(), public_ip()
+    path, isp = build_path(gateway)
+    dests = build_dests()
     db.execute('INSERT INTO events VALUES (?, ?, ?)', (time.time(), 'start', f'gateway={gateway} isp={isp}'))
     db.commit()
     if not args.quiet:
@@ -1061,41 +1195,78 @@ def cmd_monitor(args):
     signal.signal(signal.SIGTERM, on_term)
     signal.signal(signal.SIGINT, signal.default_int_handler)  # background shells start us with SIGINT ignored
 
-    prober = Prober(targets, on_sample)
+    # system_profiler takes seconds, so sample Wi-Fi off the loop that flushes samples
+    wifi_iface, wifi_stop = [iface], threading.Event()
+
+    def sample_wifi():
+        delay = 5
+        while not wifi_stop.wait(delay):
+            w = wifi_info(wifi_iface[0])
+            if w:
+                with lock:
+                    wifi_rows.append((time.time(), w['rssi'], w['noise'], w['rate'], w['channel']))
+            delay = 120
+    threading.Thread(target=sample_wifi, daemon=True).start()
+
+    def flush():
+        with lock:
+            rows, buffer[:] = list(buffer), []
+            wifi, wifi_rows[:] = list(wifi_rows), []
+        db.executemany('INSERT INTO samples VALUES (?, ?, ?)', rows)
+        db.executemany('INSERT INTO wifi VALUES (?, ?, ?, ?, ?)', wifi)
+        db.commit()
+
+    prober = Prober(path + dests, on_sample)
     prober.start()
     next_flush = next_route = next_status = time.time()
-    next_wifi = time.time() + 5
+    next_public = time.time() + 120
+    next_prune = time.time() + 3600
+    next_resolve = time.time() + 600
     try:
         while True:
             time.sleep(1)
             now = time.time()
             if now >= next_flush:
-                with lock:
-                    rows, buffer[:] = list(buffer), []
-                db.executemany('INSERT INTO samples VALUES (?, ?, ?)', rows)
-                db.commit()
+                flush()
                 next_flush = now + 5
             if now >= next_route:
-                new_gateway, iface = default_route()
-                if new_gateway != gateway:
-                    gateway = new_gateway
-                    targets, isp = build_targets(gateway)
-                    prober.set_targets(targets)
+                new_gateway, new_iface = default_route()
+                new_address = local_address()
+                changed = (new_gateway, new_iface, new_address) != (gateway, iface, address)
+                if not changed and now >= next_public:
+                    # a failed lookup (None) is not a change
+                    new_public = public_ip()
+                    changed = bool(public and new_public and new_public != public)
+                    public = new_public or public
+                    next_public = now + 120
+                if changed:
+                    gateway, iface, address = new_gateway, new_iface, new_address
+                    wifi_iface[0] = iface
+                    path, isp = build_path(gateway)
+                    dests = build_dests()
+                    prober.set_targets(path + dests)
+                    public, next_public = public_ip(), now + 120
+                    next_resolve = now + 600
                     db.execute('INSERT INTO events VALUES (?, ?, ?)', (now, 'route', f'gateway={gateway} isp={isp}'))
                     if not args.quiet:
                         print(yellow(f'{time.strftime("%H:%M:%S")}  network changed: router {gateway}, ISP edge {isp}'))
                 next_route = now + 30
-            if now >= next_wifi:
-                w = wifi_info(iface)
-                if w:
-                    db.execute('INSERT INTO wifi VALUES (?, ?, ?, ?, ?)', (now, w['rssi'], w['noise'], w['rate'], w['channel']))
-                next_wifi = now + 120
+            if now >= next_resolve:
+                # CDN addresses rotate; keep probing the ones apps would connect to now
+                new_dests = build_dests()
+                if [(t.name, t.host) for t in new_dests] != [(t.name, t.host) for t in dests]:
+                    dests = new_dests
+                    prober.set_targets(path + dests)
+                next_resolve = now + 600
+            if now >= next_prune:
+                prune(db)
+                next_prune = now + 3600
             if not args.quiet and now >= next_status:
                 with lock:
                     recent[:] = [s for s in recent if s[0] >= now - 10]
                     window = list(recent)
                 parts = []
-                for name in ('gateway', 'isp', 'internet'):
+                for name in ('gateway', 'isp', 'internet', 'internet6'):
                     s = summarize([r for _, n, r in sorted(window) if n == name])
                     if s.sent:
                         text = f'{name} {fmt_ms(s.p50)} ms' + (f' {s.loss_pct:.0f}% loss' if s.lost else '')
@@ -1105,10 +1276,9 @@ def cmd_monitor(args):
     except KeyboardInterrupt:
         pass
     finally:
+        wifi_stop.set()
         prober.stop()
-        with lock:
-            db.executemany('INSERT INTO samples VALUES (?, ?, ?)', buffer)
-        db.commit()
+        flush()
         db.close()
     return 0
 
@@ -1251,7 +1421,7 @@ def cmd_report(args):
 
     size = next((b for b in BUCKET_SIZES if span / b <= 60), BUCKET_SIZES[-1])
     n_buckets = int(span // size) + 1
-    print(bold(f'\nTimeline') + dim(f'  one column = {size // 60} min · bars = 95th-percentile latency (log scale) · '
+    print(bold('\nTimeline') + dim(f'  one column = {size // 60} min · bars = 95th-percentile latency (log scale) · '
                                      f'loss: · none ▪ <5% █ ≥5%'))
     p95s = {}
     for name in names:
@@ -1278,7 +1448,7 @@ def cmd_report(args):
     if not incidents:
         print(green('  ✓ none: no outages, loss bursts or lag spikes'))
     else:
-        events = list(db.execute('SELECT ts, kind, detail FROM events WHERE ts >= ? AND kind = "route"', (first,)))
+        events = list(db.execute("SELECT ts, kind, detail FROM events WHERE ts >= ? AND kind = 'route'", (first,)))
         wifi_rows = list(db.execute('SELECT ts, rssi FROM wifi WHERE ts >= ?', (first,)))
         counts = {}
         for inc in incidents:
@@ -1330,10 +1500,22 @@ def install_script():
     # agent keeps working if a pipx install or checkout moves
     script = os.path.join(DATA_DIR, 'netprobe.py')
     shutil.copy2(os.path.abspath(__file__), script)
-    # The PATH python3 is a stable symlink; sys.executable can point into a
-    # versioned directory that disappears on the next Homebrew upgrade
-    python = shutil.which('python3') or sys.executable
-    return python, script, os.path.join(DATA_DIR, 'agent.log')
+    return agent_python(), script, os.path.join(DATA_DIR, 'agent.log')
+
+
+def agent_python():
+    """Prefer the PATH python3, a stable symlink (sys.executable can point into a
+    versioned directory that disappears on the next Homebrew upgrade), but only if
+    it is new enough: on macOS it is often Apple's /usr/bin/python3, which is 3.9."""
+    path = shutil.which('python3')
+    if path:
+        try:
+            if not subprocess.run([path, '-c', 'import sys; sys.exit(sys.version_info < (3, 10))'],
+                                  capture_output=True, timeout=10).returncode:
+                return path
+        except (OSError, subprocess.TimeoutExpired):
+            pass
+    return sys.executable
 
 
 def cmd_agent(args):

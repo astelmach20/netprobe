@@ -15,7 +15,7 @@ Connection
   path   this Mac → router 192.168.1.1 → ISP edge 203.0.113.1 → internet 1.1.1.1
   DNS    1.0.0.1, 1.1.1.1
 
-Measuring (~61s): idle, then saturating download, upload, both
+Measuring (~61–79s): idle, then saturating download, upload, both
   idle      done
   download  done  ↓ 233 Mbps
   upload    done  ↑ 23 Mbps
@@ -65,7 +65,7 @@ pipx install git+https://github.com/astelmach20/netprobe
 ## Usage
 
 ```bash
-netprobe check            # ~60 s diagnosis (uses roughly 1 GB of data)
+netprobe check            # ~60-80 s diagnosis (uses 1 GB or more of data, depending on your speed)
 netprobe check --quick    # shorter phases
 netprobe check --no-load  # latency/loss only, no data use
 netprobe monitor          # sample continuously (Ctrl-C to stop)
@@ -83,7 +83,9 @@ Destinations default to google.com, github.com, apple.com and zoom.us. Override 
 {"destinations": ["github.com", "slack.com", "meet.google.com"]}
 ```
 
-Data lives in `~/.netprobe/` (database `netprobe.db`, kept 30 days).
+Data lives in `~/.netprobe/` (database `netprobe.db`, kept 30 days and trimmed hourly).
+
+`monitor` notices when you change networks (new router, interface, local address or public address), finds the new path, and records the change so `report` can mark incidents around it. It also looks up the destinations' addresses again every 10 minutes, since CDN addresses rotate.
 
 ## Linux
 
@@ -102,9 +104,10 @@ Works the same as on macOS, with these differences:
 ## How it works
 
 - **Router and internet:** ICMP echo over an unprivileged datagram socket. The internet anchor is 1.1.1.1.
-- **ISP router:** many ISP routers ignore pings sent to them but answer traceroute probes. netprobe finds the first ISP hop with an ICMP traceroute (skipping your gateway's own WAN address) and times its TTL-exceeded replies. On Linux it walks the TTLs itself over the same ping socket and reads the TTL-exceeded replies from the socket's error queue, since Linux `traceroute -I` needs root. These routers rate-limit such replies, so loss reported at that hop is ignored when assigning blame.
+- **IPv6:** when there's a global IPv6 route, netprobe also pings Cloudflare's 2606:4700:4700::1111 and flags IPv6 that's lossy, much slower than IPv4, or not answering at all. Apps prefer IPv6, so a bad IPv6 path hurts even when IPv4 is fine. The per-segment breakdown is IPv4 only.
+- **ISP router:** many ISP routers ignore pings sent to them but answer traceroute probes. netprobe finds the first ISP hop with an ICMP traceroute (skipping your gateway's own WAN address and private 10/8, 172.16/12 and 192.168/16 hops, which are usually a second home router) and times its TTL-exceeded replies. On Linux it walks the TTLs itself over the same ping socket and reads the TTL-exceeded replies from the socket's error queue, since Linux `traceroute -I` needs root. These routers rate-limit such replies, so loss reported at that hop is ignored when assigning blame.
 - **Destinations:** timed TCP handshakes to port 443, because many hosts drop ICMP.
-- **Load:** parallel HTTPS streams to Apple's networkQuality servers (`mensura.cdn-apple.com`), the same servers `networkQuality` uses.
+- **Load:** parallel HTTPS streams to Apple's networkQuality servers (`mensura.cdn-apple.com`), the same servers `networkQuality` uses. Each load phase starts with 4 streams per direction and adds 4 more every 2 s while throughput keeps rising by more than 10%, up to 16, because a line that isn't full hides bufferbloat. Measurement starts once throughput stops rising.
 - **Blame:** when latency or loss rises at the internet anchor, the segment that accounts for at least half of the rise gets the blame. A rise at the ISP hop but not at the router means the gateway's queue or the access line (bufferbloat). A rise only past the ISP hop means ISP or upstream congestion.
 
 ## License
