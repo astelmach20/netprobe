@@ -7,14 +7,17 @@ Commands:
   monitor   sample the path continuously into a local database
   report    summarize what monitor recorded: timeline, incidents, who to blame
   agent     install or remove a background agent that runs monitor
-            (launchd on macOS, systemd --user on Linux)
+            (launchd on macOS, systemd --user on Linux, Task Scheduler on Windows)
 
 The path is split into segments so problems can be located:
   this computer -> router (Wi-Fi/LAN) -> ISP edge (first hop past the router) -> internet
 """
 
 import argparse
+import ctypes
+import functools
 import http.client
+import ipaddress
 import json
 import math
 import os
@@ -35,17 +38,19 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 
-DATA_DIR = os.path.expanduser('~/.netprobe')
+DATA_DIR = os.path.join(os.path.expanduser('~'), '.netprobe')
 DB_PATH = os.path.join(DATA_DIR, 'netprobe.db')
 CONFIG_PATH = os.path.join(DATA_DIR, 'config.json')
 AGENT_LABEL = 'com.netprobe.monitor'
 AGENT_PLIST = os.path.expanduser(f'~/Library/LaunchAgents/{AGENT_LABEL}.plist')
 AGENT_UNIT = 'netprobe.service'
 AGENT_UNIT_PATH = os.path.expanduser(f'~/.config/systemd/user/{AGENT_UNIT}')
+AGENT_TASK = 'netprobe'
 
-__version__ = '0.3.0'
+__version__ = '0.4.0'
 IS_LINUX = sys.platform.startswith('linux')
-THIS_HOST = 'this computer' if IS_LINUX else 'this Mac'
+IS_WINDOWS = sys.platform == 'win32'
+THIS_HOST = 'this Mac' if sys.platform == 'darwin' else 'this computer'
 
 # Apple's networkQuality servers: built for saturation tests, no per-request cap
 LOAD_HOST = 'mensura.cdn-apple.com'
@@ -68,7 +73,21 @@ PHASES = [('idle', ()), ('download', ('down',)), ('upload', ('up',)), ('both', (
 
 # ---------------------------------------------------------------- output
 
-COLOR = sys.stdout.isatty() and not os.environ.get('NO_COLOR')
+def enable_ansi():
+    """Escape codes work on a macOS/Linux terminal as is; Windows consoles need
+    virtual terminal processing switched on (Windows 10 1511 and later)."""
+    if not (sys.stdout and sys.stdout.isatty()):  # None under pythonw
+        return False
+    if not IS_WINDOWS:
+        return True
+    kernel32 = ctypes.WinDLL('kernel32')
+    handle, mode = kernel32.GetStdHandle(-11), ctypes.c_uint32()  # STD_OUTPUT_HANDLE
+    return bool(kernel32.GetConsoleMode(handle, ctypes.byref(mode))
+                and kernel32.SetConsoleMode(handle, mode.value | 0x4))  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+
+
+ANSI = enable_ansi()
+COLOR = ANSI and not os.environ.get('NO_COLOR')
 
 
 def style(text, code):
@@ -95,7 +114,7 @@ def pad(text, width):
 
 
 def live(line):
-    if sys.stdout.isatty():
+    if ANSI:
         sys.stdout.write('\r\033[K' + line)
         sys.stdout.flush()
 
@@ -165,6 +184,8 @@ def run(cmd, timeout=30):
 def default_route():
     if IS_LINUX:
         return linux_default_route()
+    if IS_WINDOWS:
+        return windows_default_route()
     out = run(['route', '-n', 'get', 'default'])
     gw = re.search(r'gateway:\s*(\S+)', out)
     iface = re.search(r'interface:\s*(\S+)', out)
@@ -236,6 +257,8 @@ def trace_hops(dest, max_hops=10):
         # Linux traceroute needs root for ICMP mode (and often isn't installed),
         # so walk the TTLs over our own unprivileged ping socket
         return linux_icmp_trace(dest, max_hops)
+    if IS_WINDOWS:
+        return windows_icmp_trace(dest, max_hops)
     # ICMP traceroute, so the hop count matches the path our ICMP probes take
     out = run(['traceroute', '-I', '-n', '-m', str(max_hops), '-q', '1', '-w', '1', dest], timeout=30)
     return [(int(m.group(1)), m.group(2)) for line in out.splitlines()
@@ -265,9 +288,12 @@ def linux_icmp_trace(dest, max_hops, timeout=2.0):
     return sorted((h, ip) for h, ip in hops.items() if reached is None or h < reached)
 
 
-def dns_servers():
+def dns_servers(iface=None):
+    """iface is the default-route interface (used on Windows)."""
     if IS_LINUX:
         return linux_dns_servers()
+    if IS_WINDOWS:
+        return windows_dns_servers(iface)
     servers = []
     for m in re.finditer(r'nameserver\[\d+\]\s*:\s*(\S+)', run(['scutil', '--dns'])):
         if m.group(1) not in servers:
@@ -294,9 +320,11 @@ def linux_dns_servers():
 
 
 def wifi_info(iface=None):
-    """Current Wi-Fi link, or None. iface is the default-route interface (used on Linux)."""
+    """Current Wi-Fi link, or None. iface is the default-route interface (used on Linux and Windows)."""
     if IS_LINUX:
         return linux_wifi_info(iface)
+    if IS_WINDOWS:
+        return windows_wifi_info(iface)
     out = run(['system_profiler', 'SPAirPortDataType', '-json'], timeout=30)
     try:
         interfaces = json.loads(out)['SPAirPortDataType'][0]['spairport_airport_interfaces']
@@ -354,7 +382,8 @@ def ipv6_available():
             s.connect((INTERNET_ANCHOR6, 53))  # picks a route and source address; sends nothing
             if s.getsockname()[0].lower().startswith('fe80'):
                 return False
-        socket.socket(socket.AF_INET6, socket.SOCK_DGRAM, socket.IPPROTO_ICMPV6).close()
+        if not IS_WINDOWS:  # Windows probes through its ICMP API, which needs no socket
+            socket.socket(socket.AF_INET6, socket.SOCK_DGRAM, socket.IPPROTO_ICMPV6).close()
     except OSError:
         return False
     return True
@@ -369,7 +398,7 @@ def resolve(host):
 
 def curl_timings(host):
     """DNS, TCP, TLS and first-byte times for a real HTTPS request, in ms."""
-    out = run(['curl', '-s', '-o', '/dev/null', '--max-time', '10', '-w', '%{json}', f'https://{host}/'], timeout=15)
+    out = run(['curl', '-s', '-o', os.devnull, '--max-time', '10', '-w', '%{json}', f'https://{host}/'], timeout=15)
     try:
         d = json.loads(out)
     except ValueError:
@@ -396,6 +425,170 @@ def load_config():
     except ValueError as e:
         print(yellow(f'Ignoring {CONFIG_PATH}: {e}'), file=sys.stderr)
     return cfg
+
+
+# ---------------------------------------------------------------- Windows
+#
+# Windows has no unprivileged ICMP sockets (raw sockets need admin), but its ICMP
+# API (what ping and tracert use) sends echoes with any TTL and reports the router
+# that answered, with no special rights. Each call blocks until the reply or the
+# timeout, so the prober runs them on a thread pool.
+
+IP_SUCCESS, IP_TTL_EXPIRED_TRANSIT = 0, 11013
+TCP_MAXRT = 5
+ECHO_PAYLOAD = b'netprobe' + bytes(24)
+
+
+class IpOptionInformation(ctypes.Structure):
+    _fields_ = [('Ttl', ctypes.c_ubyte), ('Tos', ctypes.c_ubyte), ('Flags', ctypes.c_ubyte),
+                ('OptionsSize', ctypes.c_ubyte), ('OptionsData', ctypes.c_void_p)]
+
+
+class IcmpEchoReply(ctypes.Structure):
+    _fields_ = [('Address', ctypes.c_uint32), ('Status', ctypes.c_uint32), ('RoundTripTime', ctypes.c_uint32),
+                ('DataSize', ctypes.c_uint16), ('Reserved', ctypes.c_uint16), ('Data', ctypes.c_void_p),
+                ('Options', IpOptionInformation)]
+
+
+class Ipv6AddressEx(ctypes.Structure):
+    _pack_ = 1
+    _fields_ = [('sin6_port', ctypes.c_uint16), ('sin6_flowinfo', ctypes.c_uint32),
+                ('sin6_addr', ctypes.c_ubyte * 16), ('sin6_scope_id', ctypes.c_uint32)]
+
+
+class Icmpv6EchoReply(ctypes.Structure):
+    _fields_ = [('Address', Ipv6AddressEx), ('Status', ctypes.c_uint32), ('RoundTripTime', ctypes.c_uint32)]
+
+
+class SockaddrIn6(ctypes.Structure):
+    _fields_ = [('sin6_family', ctypes.c_uint16), ('sin6_port', ctypes.c_uint16), ('sin6_flowinfo', ctypes.c_uint32),
+                ('sin6_addr', ctypes.c_ubyte * 16), ('sin6_scope_id', ctypes.c_uint32)]
+
+
+class MibIpForwardRow(ctypes.Structure):
+    _fields_ = [(name, ctypes.c_uint32) for name in (
+        'dest', 'mask', 'policy', 'next_hop', 'if_index', 'type', 'proto', 'age', 'next_hop_as',
+        'metric1', 'metric2', 'metric3', 'metric4', 'metric5')]
+
+
+@functools.cache
+def iphlpapi():
+    from ctypes import wintypes as w
+    lib = ctypes.WinDLL('iphlpapi')
+    lib.IcmpCreateFile.restype = lib.Icmp6CreateFile.restype = w.HANDLE
+    lib.IcmpCloseHandle.argtypes = [w.HANDLE]
+    lib.IcmpSendEcho.argtypes = [w.HANDLE, ctypes.c_uint32, ctypes.c_void_p, w.WORD,
+                                 ctypes.POINTER(IpOptionInformation), ctypes.c_void_p, w.DWORD, w.DWORD]
+    lib.Icmp6SendEcho2.argtypes = [w.HANDLE, w.HANDLE, ctypes.c_void_p, ctypes.c_void_p,
+                                   ctypes.POINTER(SockaddrIn6), ctypes.POINTER(SockaddrIn6), ctypes.c_void_p, w.WORD,
+                                   ctypes.POINTER(IpOptionInformation), ctypes.c_void_p, w.DWORD, w.DWORD]
+    lib.IcmpSendEcho.restype = lib.Icmp6SendEcho2.restype = w.DWORD
+    lib.GetBestRoute.argtypes = [w.DWORD, w.DWORD, ctypes.POINTER(MibIpForwardRow)]
+    lib.ConvertInterfaceIndexToLuid.argtypes = [w.ULONG, ctypes.POINTER(ctypes.c_uint64)]
+    lib.ConvertInterfaceLuidToAlias.argtypes = [ctypes.POINTER(ctypes.c_uint64), ctypes.c_wchar_p, ctypes.c_size_t]
+    return lib
+
+
+def windows_ping(host, ttl=None, timeout=PROBE_TIMEOUT):
+    """One echo through the Windows ICMP API: (rtt ms, kind, router ip), where kind is
+    'reply' (host answered), 'ttl' (a router at that TTL answered) or None (lost)."""
+    lib = iphlpapi()
+    v6 = ':' in host
+    handle = lib.Icmp6CreateFile() if v6 else lib.IcmpCreateFile()
+    if handle in (None, ctypes.c_void_p(-1).value):
+        return None, None, None
+    reply_type = Icmpv6EchoReply if v6 else IcmpEchoReply
+    buf = ctypes.create_string_buffer(ctypes.sizeof(reply_type) + len(ECHO_PAYLOAD) + 64)
+    opts = IpOptionInformation(Ttl=ttl or 64)
+    try:
+        # time it ourselves: the API's RoundTripTime is in whole milliseconds
+        start = time.perf_counter()
+        if v6:
+            src, dst = SockaddrIn6(sin6_family=socket.AF_INET6), SockaddrIn6(sin6_family=socket.AF_INET6)
+            dst.sin6_addr[:] = socket.inet_pton(socket.AF_INET6, host)
+            lib.Icmp6SendEcho2(handle, None, None, None, ctypes.byref(src), ctypes.byref(dst), ECHO_PAYLOAD,
+                               len(ECHO_PAYLOAD), ctypes.byref(opts), buf, len(buf), int(timeout * 1000))
+        else:
+            dest = struct.unpack('<I', socket.inet_aton(host))[0]  # IPAddr: network byte order in memory
+            lib.IcmpSendEcho(handle, dest, ECHO_PAYLOAD, len(ECHO_PAYLOAD), ctypes.byref(opts), buf, len(buf),
+                             int(timeout * 1000))
+        rtt = (time.perf_counter() - start) * 1000
+    finally:
+        lib.IcmpCloseHandle(handle)
+    reply = reply_type.from_buffer(buf)
+    kind = {IP_SUCCESS: 'reply', IP_TTL_EXPIRED_TRANSIT: 'ttl'}.get(reply.Status)
+    if not kind:
+        return None, None, None
+    router = socket.inet_ntop(socket.AF_INET6, bytes(reply.Address.sin6_addr)) if v6 else \
+             socket.inet_ntoa(struct.pack('<I', reply.Address))
+    return rtt, kind, router
+
+
+def windows_default_route():
+    """(gateway, interface alias) of the route Windows would use to reach the internet."""
+    lib = iphlpapi()
+    row = MibIpForwardRow()
+    if lib.GetBestRoute(struct.unpack('<I', socket.inet_aton(INTERNET_ANCHOR))[0], 0, ctypes.byref(row)):
+        return None, None
+    gateway = socket.inet_ntoa(struct.pack('<I', row.next_hop))
+    luid, alias = ctypes.c_uint64(), ctypes.create_unicode_buffer(257)
+    iface = None
+    if not lib.ConvertInterfaceIndexToLuid(row.if_index, ctypes.byref(luid)) and \
+            not lib.ConvertInterfaceLuidToAlias(ctypes.byref(luid), alias, len(alias)):
+        iface = alias.value
+    return (None if gateway == '0.0.0.0' else gateway), iface  # 0.0.0.0: on-link, e.g. a VPN or PPP link
+
+
+def windows_icmp_trace(dest, max_hops):
+    # one probe per TTL, all at once, so the trace takes a single timeout
+    with ThreadPoolExecutor(max_workers=max_hops) as pool:
+        replies = list(pool.map(lambda ttl: windows_ping(dest, ttl, timeout=1.0), range(1, max_hops + 1)))
+    hops = []
+    for hop, (_, kind, router) in enumerate(replies, 1):
+        if kind == 'reply':
+            break
+        if kind == 'ttl':
+            hops.append((hop, router))
+    return hops
+
+
+def windows_dns_servers(iface):
+    if not iface:
+        return []
+    servers = []
+    for family in ('ipv4', 'ipv6'):
+        for token in run(['netsh', 'interface', family, 'show', 'dnsservers', iface]).split():
+            try:
+                ip = ipaddress.ip_address(token.split('%')[0])
+            except ValueError:
+                continue
+            if not (ip.version == 6 and ip.is_site_local):  # fec0:0:0:ffff::1-3: Windows' "none configured" placeholders
+                servers.append(str(ip))
+    return list(dict.fromkeys(servers))
+
+
+def windows_wifi_info(iface):
+    for block in re.split(r'\n\s*\n', run(['netsh', 'wlan', 'show', 'interfaces'])):
+        f = {k.strip().lower(): v.strip() for k, v in re.findall(r'^\s*([^:\n]+?)\s+:\s(.*)$', block, re.M)}
+        if f.get('name') != iface or f.get('state', '').lower() != 'connected':
+            continue
+        rssi = f.get('rssi')
+        if rssi is None and (pct := re.match(r'(\d+)%', f.get('signal', ''))):
+            rssi = int(pct.group(1)) // 2 - 100  # Windows maps -100..-50 dBm onto 0..100%
+        channel = f.get('channel')
+        if channel and channel.isdigit():
+            band = f.get('band', '').replace(' ', '') or ('2.4GHz' if int(channel) <= 14 else '5GHz')
+            channel = f'{channel} ({band})'
+        rate = f.get('transmit rate (mbps)', '')
+        return {
+            'interface': iface,
+            'phy': f.get('radio type'),
+            'channel': channel,
+            'rate': round(float(rate)) if re.fullmatch(r'[\d.]+', rate) else None,
+            'rssi': int(rssi) if rssi is not None else None,
+            'noise': None,  # netsh doesn't report the noise floor
+        }
+    return None
 
 
 # ---------------------------------------------------------------- probing
@@ -462,6 +655,14 @@ def icmp_socket():
         sock.setsockopt(socket.IPPROTO_IP, IP_RECVERR, 1)
         sock.setblocking(False)
     return sock
+
+
+def check_icmp():
+    """Exit with the fix now if ICMP probing is not allowed, rather than after path discovery."""
+    if IS_WINDOWS:
+        iphlpapi()  # the ICMP API needs no special rights
+    else:
+        icmp_socket().close()
 
 
 def icmp6_socket():
@@ -551,13 +752,18 @@ class Prober:
         self._pending = {}  # seq -> (name, ip, sent_monotonic, sent_wall)
         self._ident = os.getpid() & 0xFFFF
         self._seq = random.randrange(0x10000)
+        self._tcp_pool = ThreadPoolExecutor(max_workers=8)
+        self._threads = [threading.Thread(target=self._send_loop, daemon=True)]
+        if IS_WINDOWS:
+            # each probe blocks until its reply or timeout: room for every target's in-flight probes
+            self._sock = self._sock6 = None
+            self._icmp_pool = ThreadPoolExecutor(max_workers=64)
+            return
         self._sock = icmp_socket()
         if not IS_LINUX:
             self._sock.settimeout(0.2)
         self._sock6 = icmp6_socket()
-        self._tcp_pool = ThreadPoolExecutor(max_workers=8)
-        self._threads = [threading.Thread(target=self._send_loop, daemon=True),
-                         threading.Thread(target=self._recv_loop, daemon=True)]
+        self._threads.append(threading.Thread(target=self._recv_loop, daemon=True))
         if self._sock6:
             self._threads.append(threading.Thread(target=self._recv_loop6, daemon=True))
 
@@ -570,6 +776,9 @@ class Prober:
         for t in self._threads:
             t.join(timeout=2)
         self._tcp_pool.shutdown(wait=False, cancel_futures=True)
+        if IS_WINDOWS:
+            self._icmp_pool.shutdown(wait=False, cancel_futures=True)
+            return
         self._sock.close()
         if self._sock6:
             self._sock6.close()
@@ -594,6 +803,9 @@ class Prober:
             self._stop.wait(0.01)
 
     def _send_icmp(self, t):
+        if IS_WINDOWS:
+            self._icmp_pool.submit(self._windows_probe, t)
+            return
         with self._lock:
             self._seq = seq = (self._seq + 1) & 0xFFFF
             self._pending[seq] = (t.name, t.host, time.monotonic(), time.time())
@@ -689,11 +901,31 @@ class Prober:
         for _, e in expired:
             self.on_sample(e[3], e[0], None)
 
-    def _tcp_probe(self, t):
-        wall, start = time.time(), time.monotonic()
+    def _windows_probe(self, t):
+        wall = time.time()
         try:
-            with socket.create_connection((t.host, t.port), timeout=PROBE_TIMEOUT):
-                rtt = (time.monotonic() - start) * 1000
+            rtt, kind, _ = windows_ping(INTERNET_ANCHOR if t.ttl else t.host, t.ttl)
+        except OSError:  # unparsable address, API failure: count as lost
+            rtt = kind = None
+        # ISP hops are often load-balanced pairs, so any router at that TTL counts
+        if not self._stop.is_set():
+            self.on_sample(wall, t.name, rtt if kind == ('ttl' if t.ttl else 'reply') else None)
+
+    def _tcp_probe(self, t):
+        # perf_counter: before Python 3.13, monotonic() on Windows ticks only every ~16 ms
+        wall, start = time.time(), time.perf_counter()
+        try:
+            if IS_WINDOWS:
+                # a socket timeout waits in Winsock's select(), which wakes on ~16 ms timer
+                # ticks and would round every handshake up; connect blocking instead and let
+                # TCP_MAXRT (seconds of retransmission) enforce the timeout
+                with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                    s.setsockopt(socket.IPPROTO_TCP, TCP_MAXRT, math.ceil(PROBE_TIMEOUT))
+                    s.connect((t.host, t.port))
+                    rtt = (time.perf_counter() - start) * 1000
+            else:
+                with socket.create_connection((t.host, t.port), timeout=PROBE_TIMEOUT):
+                    rtt = (time.perf_counter() - start) * 1000
         except OSError:
             rtt = None
         if not self._stop.is_set():
@@ -765,7 +997,8 @@ class Load:
         sock = conn.sock
         if sock:
             try:
-                sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('ii', 1, 0))
+                # struct linger: two ints, but two u_shorts in Winsock
+                sock.setsockopt(socket.SOL_SOCKET, socket.SO_LINGER, struct.pack('HH' if IS_WINDOWS else 'ii', 1, 0))
             except OSError:
                 pass
         conn.close()
@@ -1088,7 +1321,7 @@ def cmd_check(args):
     gateway, iface = default_route()
     if not gateway:
         sys.exit('netprobe: no default route; you appear to be offline.')
-    icmp_socket().close()  # fail now, with the fix, rather than after path discovery
+    check_icmp()
 
     print(bold('netprobe check'))
     live(dim('  Discovering path…'))
@@ -1101,7 +1334,7 @@ def cmd_check(args):
     app = [(h, curl_timings(h)) for h, _ in dests]
     live('')
     ipv6 = ipv6_available()
-    print_connection(iface, wifi, gateway, isp, dns_servers(), ipv6)
+    print_connection(iface, wifi, gateway, isp, dns_servers(iface), ipv6)
     print_app_timings(app)
 
     targets = path_targets(gateway, isp, isp_hop, 0.2, ipv6) + [Target(h, ip, 'tcp', 1.0) for h, ip in dests]
@@ -1158,6 +1391,8 @@ def prune(db):
 
 
 def cmd_monitor(args):
+    if args.log:  # the Windows agent runs under pythonw, which has no stdout or stderr
+        sys.stdout = sys.stderr = open(args.log, 'a', encoding='utf-8')
     sys.stdout.reconfigure(line_buffering=True)  # status lines reach logs promptly
     cfg = load_config()
     db = open_db()
@@ -1178,7 +1413,7 @@ def cmd_monitor(args):
         return [Target(h, ip, 'tcp', args.interval * 10) for h in cfg['destinations'] if (ip := resolve(h))]
 
     gateway, iface = default_route()
-    icmp_socket().close()  # exit with the fix if ICMP is not allowed
+    check_icmp()
     # Many networks share a router address like 192.168.1.1, so a change of network
     # also shows as a new local address or public address. (The router's MAC would be
     # better, but macOS hides the ARP table from apps without Local Network access.)
@@ -1190,7 +1425,7 @@ def cmd_monitor(args):
     if not args.quiet:
         print(bold('netprobe monitor') + dim(f'  router {gateway}, ISP edge {isp}, writing to {DB_PATH}  (Ctrl-C to stop)'))
 
-    def on_term(signum, frame):  # launchd and systemd stop agents with SIGTERM
+    def on_term(signum, frame):  # launchd and systemd stop agents with SIGTERM (Task Scheduler just ends the process)
         raise KeyboardInterrupt
     signal.signal(signal.SIGTERM, on_term)
     signal.signal(signal.SIGINT, signal.default_int_handler)  # background shells start us with SIGINT ignored
@@ -1506,7 +1741,12 @@ def install_script():
 def agent_python():
     """Prefer the PATH python3, a stable symlink (sys.executable can point into a
     versioned directory that disappears on the next Homebrew upgrade), but only if
-    it is new enough: on macOS it is often Apple's /usr/bin/python3, which is 3.9."""
+    it is new enough: on macOS it is often Apple's /usr/bin/python3, which is 3.9.
+    On Windows, use pythonw from the same install so the agent opens no console window
+    (and skip PATH: python3 there is often the Microsoft Store installer stub)."""
+    if IS_WINDOWS:
+        pythonw = os.path.join(os.path.dirname(sys.executable), 'pythonw.exe')
+        return pythonw if os.path.exists(pythonw) else sys.executable
     path = shutil.which('python3')
     if path:
         try:
@@ -1521,6 +1761,8 @@ def agent_python():
 def cmd_agent(args):
     if IS_LINUX:
         return linux_agent(args)
+    if IS_WINDOWS:
+        return windows_agent(args)
     domain = f'gui/{os.getuid()}'
     if args.action == 'install':
         os.makedirs(os.path.dirname(AGENT_PLIST), exist_ok=True)
@@ -1614,6 +1856,60 @@ def linux_agent(args):
     return 0
 
 
+def windows_agent(args):
+    def schtasks(*cmd):
+        return subprocess.run(['schtasks', *cmd], capture_output=True, text=True)
+
+    if args.action == 'install':
+        python, script, log = install_script()
+        user = f'{os.environ.get("USERDOMAIN", "")}\\{os.environ.get("USERNAME", "")}'.lstrip('\\')
+        esc = lambda s: s.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;').replace('"', '&quot;')
+        # a task XML rather than schtasks flags: only XML can turn off the 72-hour run limit
+        # and the battery rules, and restart the monitor if it dies
+        task = (
+            '<?xml version="1.0" encoding="UTF-16"?>\n'
+            '<Task version="1.2" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">\n'
+            '  <RegistrationInfo><Description>netprobe network monitor</Description></RegistrationInfo>\n'
+            f'  <Triggers><LogonTrigger><Enabled>true</Enabled><UserId>{esc(user)}</UserId></LogonTrigger></Triggers>\n'
+            '  <Principals><Principal id="Author"><LogonType>InteractiveToken</LogonType>'
+            '<RunLevel>LeastPrivilege</RunLevel></Principal></Principals>\n'
+            '  <Settings>\n'
+            '    <MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>\n'
+            '    <DisallowStartIfOnBatteries>false</DisallowStartIfOnBatteries>\n'
+            '    <StopIfGoingOnBatteries>false</StopIfGoingOnBatteries>\n'
+            '    <ExecutionTimeLimit>PT0S</ExecutionTimeLimit>\n'
+            '    <RestartOnFailure><Interval>PT1M</Interval><Count>999</Count></RestartOnFailure>\n'
+            '  </Settings>\n'
+            '  <Actions Context="Author"><Exec>\n'
+            f'    <Command>{esc(python)}</Command>\n'
+            f'    <Arguments>{esc(subprocess.list2cmdline([script, "monitor", "--quiet", "--log", log]))}</Arguments>\n'
+            '  </Exec></Actions>\n'
+            '</Task>\n'
+        )
+        xml_path = os.path.join(DATA_DIR, 'agent-task.xml')
+        with open(xml_path, 'w', encoding='utf-16') as f:
+            f.write(task)
+        schtasks('/End', '/TN', AGENT_TASK)
+        for cmd in (['/Create', '/TN', AGENT_TASK, '/XML', xml_path, '/F'], ['/Run', '/TN', AGENT_TASK]):
+            r = schtasks(*cmd)
+            if r.returncode:
+                sys.exit(f'netprobe: schtasks {cmd[0]} failed: {(r.stderr or r.stdout).strip()}')
+        print(f'Installed the "{AGENT_TASK}" scheduled task; monitor runs in the background and at logon. Logs: {log}')
+        print(dim(f'The agent runs a copy at {script}; re-run `agent install` after updating netprobe.'))
+    elif args.action == 'uninstall':
+        schtasks('/End', '/TN', AGENT_TASK)
+        schtasks('/Delete', '/TN', AGENT_TASK, '/F')
+        print(f'Removed the agent. Recorded data stays in {DB_PATH}.')
+    else:
+        r = schtasks('/Query', '/TN', AGENT_TASK, '/FO', 'CSV', '/NH')
+        if r.returncode:
+            print('Agent not installed.')
+        else:
+            state = r.stdout.strip().split('","')[-1].strip('"')  # "\netprobe","N/A","Running"
+            print(f'Agent {state.lower()}.' if state else 'Agent installed.')
+    return 0
+
+
 # ---------------------------------------------------------------- main
 
 def main():
@@ -1631,6 +1927,7 @@ def main():
     p = sub.add_parser('monitor', help='sample continuously into ~/.netprobe/netprobe.db')
     p.add_argument('--interval', type=float, default=1.0, help='seconds between pings per segment (default 1)')
     p.add_argument('--quiet', action='store_true', help='no status lines')
+    p.add_argument('--log', help=argparse.SUPPRESS)  # used by the Windows agent
     p.set_defaults(func=cmd_monitor)
 
     p = sub.add_parser('report', help='summarize recorded data')
@@ -1638,13 +1935,20 @@ def main():
     p.add_argument('--limit', type=int, default=20, help='max incidents to list (default 20)')
     p.set_defaults(func=cmd_report)
 
-    p = sub.add_parser('agent', help='run monitor in the background (launchd on macOS, systemd --user on Linux)')
+    p = sub.add_parser('agent', help='run monitor in the background '
+                                     '(launchd on macOS, systemd --user on Linux, Task Scheduler on Windows)')
     p.add_argument('action', choices=['install', 'uninstall', 'status'])
     p.set_defaults(func=cmd_agent)
 
+    if IS_WINDOWS:
+        # a console takes any character, but output redirected to a file or pipe would
+        # use the ANSI code page, which has no ✓, ↓ or ▁
+        for stream in (sys.stdout, sys.stderr):
+            if stream and not stream.isatty():
+                stream.reconfigure(encoding='utf-8')
     args = parser.parse_args()
-    if args.command != 'report' and sys.platform != 'darwin' and not IS_LINUX:
-        sys.exit(f'netprobe: {args.command} supports macOS and Linux only (this is {sys.platform}).')
+    if args.command != 'report' and sys.platform != 'darwin' and not IS_LINUX and not IS_WINDOWS:
+        sys.exit(f'netprobe: {args.command} supports macOS, Linux and Windows only (this is {sys.platform}).')
     if args.command == 'report':
         try:
             args.since_seconds = parse_duration(args.since)
