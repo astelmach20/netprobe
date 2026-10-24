@@ -1,6 +1,6 @@
 # netprobe
 
-Finds where your network is slow, and when. Runs on macOS and Linux; one Python file, standard library only, no root needed.
+Finds where your network is slow, and when. Runs on macOS, Linux and Windows; one Python file, standard library only, no root or admin needed.
 
 ```bash
 pipx install git+https://github.com/astelmach20/netprobe
@@ -101,9 +101,20 @@ Works the same as on macOS, with these differences:
 - **Real-destination timings** (DNS/TCP/TLS/first byte) use `curl`; without it those rows show as failed and everything else still works.
 - **Agent:** `netprobe agent install` writes a systemd user unit, `~/.config/systemd/user/netprobe.service`. It runs while you are logged in; to keep it running after you log out, run `loginctl enable-linger $USER`.
 
+## Windows
+
+Works on Windows 10 and 11 from a normal (non-admin) prompt, with these differences:
+
+- **Install:** `pipx install git+https://github.com/astelmach20/netprobe`, or run `netprobe.py` with `py netprobe.py check`. `curl` ships with Windows 10 and later.
+- **ICMP:** Windows has no unprivileged ICMP sockets, so netprobe pings and walks TTLs through the Windows ICMP API (`IcmpSendEcho`, what `ping` and `tracert` use), which needs no admin rights. Each probe is timed with a high-resolution clock rather than the API's whole-millisecond round-trip time.
+- **Destinations:** TCP handshakes connect blocking, with `TCP_MAXRT` enforcing the 2 s timeout, because a socket timeout makes Python wait in Winsock's `select()`, which rounds waits up to ~16 ms timer ticks.
+- **Route and DNS:** default route and interface from `GetBestRoute`; DNS servers from `netsh interface ipv4/ipv6 show dnsservers`.
+- **Wi-Fi:** from `netsh wlan show interfaces`. Older Windows builds report signal only as a percentage, which netprobe converts to dBm; there is no noise floor, so no SNR. netsh output is parsed in English; on other display languages Wi-Fi details are skipped.
+- **Agent:** `netprobe agent install` registers a `netprobe` Task Scheduler task that starts at logon under `pythonw` (no console window), restarts it if it dies, and logs to `~/.netprobe/agent.log`. Stopping it ends the process, so up to 5 s of unflushed samples are lost.
+
 ## How it works
 
-- **Router and internet:** ICMP echo over an unprivileged datagram socket. The internet anchor is 1.1.1.1.
+- **Router and internet:** ICMP echo over an unprivileged datagram socket (the ICMP API on Windows). The internet anchor is 1.1.1.1.
 - **IPv6:** when there's a global IPv6 route, netprobe also pings Cloudflare's 2606:4700:4700::1111 and flags IPv6 that's lossy, much slower than IPv4, or not answering at all. Apps prefer IPv6, so a bad IPv6 path hurts even when IPv4 is fine. The per-segment breakdown is IPv4 only.
 - **ISP router:** many ISP routers ignore pings sent to them but answer traceroute probes. netprobe finds the first ISP hop with an ICMP traceroute (skipping your gateway's own WAN address and private 10/8, 172.16/12 and 192.168/16 hops, which are usually a second home router) and times its TTL-exceeded replies. On Linux it walks the TTLs itself over the same ping socket and reads the TTL-exceeded replies from the socket's error queue, since Linux `traceroute -I` needs root. These routers rate-limit such replies, so loss reported at that hop is ignored when assigning blame.
 - **Destinations:** timed TCP handshakes to port 443, because many hosts drop ICMP.
