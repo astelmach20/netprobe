@@ -325,25 +325,50 @@ def wifi_info(iface=None):
         return linux_wifi_info(iface)
     if IS_WINDOWS:
         return windows_wifi_info(iface)
-    out = run(['system_profiler', 'SPAirPortDataType', '-json'], timeout=30)
+    return mac_wifi_info()
+
+
+# CoreWLAN enums: CWPHYMode, CWChannelBand, CWChannelWidth
+MAC_PHY_MODES = {1: '802.11a', 2: '802.11b', 3: '802.11g', 4: '802.11n', 5: '802.11ac', 6: '802.11ax', 7: '802.11be'}
+MAC_BANDS = {1: '2.4GHz', 2: '5GHz', 3: '6GHz'}
+MAC_WIDTHS = {1: 20, 2: 40, 3: 80, 4: 160, 5: 320}
+
+
+def mac_wifi_info():
+    # Read the associated link from CoreWLAN rather than system_profiler: system_profiler
+    # also scans for nearby networks, which takes the radio off-channel for several seconds
+    # and shows up as the very router-hop latency spikes monitor is looking for.
     try:
-        interfaces = json.loads(out)['SPAirPortDataType'][0]['spairport_airport_interfaces']
-    except (ValueError, KeyError, IndexError):
+        objc = ctypes.cdll.LoadLibrary('/usr/lib/libobjc.dylib')
+        ctypes.cdll.LoadLibrary('/System/Library/Frameworks/CoreWLAN.framework/CoreWLAN')
+    except OSError:
         return None
-    for iface in interfaces:
-        cur = iface.get('spairport_current_network_information')
-        if not cur:
-            continue
-        m = re.match(r'(-?\d+) dBm / (-?\d+) dBm', cur.get('spairport_signal_noise', ''))
-        return {
-            'interface': iface.get('_name'),
-            'phy': cur.get('spairport_network_phymode'),
-            'channel': cur.get('spairport_network_channel'),
-            'rate': cur.get('spairport_network_rate'),
-            'rssi': int(m.group(1)) if m else None,
-            'noise': int(m.group(2)) if m else None,
-        }
-    return None
+    objc.objc_getClass.restype = objc.sel_registerName.restype = ctypes.c_void_p
+
+    def send(restype, obj, selector):
+        msg = ctypes.CFUNCTYPE(restype, ctypes.c_void_p, ctypes.c_void_p)(('objc_msgSend', objc))
+        return msg(obj, objc.sel_registerName(selector.encode()))
+
+    client = send(ctypes.c_void_p, objc.objc_getClass(b'CWWiFiClient'), 'sharedWiFiClient')
+    iface = client and send(ctypes.c_void_p, client, 'interface')
+    channel = iface and send(ctypes.c_void_p, iface, 'wlanChannel')
+    rssi = iface and send(ctypes.c_long, iface, 'rssiValue')
+    if not channel or not rssi:  # radio off or not associated
+        return None
+    name = send(ctypes.c_void_p, iface, 'interfaceName')
+    number = send(ctypes.c_long, channel, 'channelNumber')
+    band = MAC_BANDS.get(send(ctypes.c_long, channel, 'channelBand'))
+    width = MAC_WIDTHS.get(send(ctypes.c_long, channel, 'channelWidth'))
+    noise = send(ctypes.c_long, iface, 'noiseMeasurement')
+    rate = send(ctypes.c_double, iface, 'transmitRate')
+    return {
+        'interface': name and send(ctypes.c_char_p, name, 'UTF8String').decode(),
+        'phy': MAC_PHY_MODES.get(send(ctypes.c_long, iface, 'activePHYMode')),
+        'channel': f'{number} ({", ".join(filter(None, (band, width and f"{width}MHz")))})' if band or width else str(number),
+        'rate': round(rate) if rate else None,
+        'rssi': rssi,
+        'noise': noise or None,
+    }
 
 
 def linux_wifi_info(iface):
@@ -1430,7 +1455,7 @@ def cmd_monitor(args):
     signal.signal(signal.SIGTERM, on_term)
     signal.signal(signal.SIGINT, signal.default_int_handler)  # background shells start us with SIGINT ignored
 
-    # system_profiler takes seconds, so sample Wi-Fi off the loop that flushes samples
+    # iw/netsh take a moment, so sample Wi-Fi off the loop that flushes samples
     wifi_iface, wifi_stop = [iface], threading.Event()
 
     def sample_wifi():
