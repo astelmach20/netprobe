@@ -1201,15 +1201,25 @@ LOCATIONS = {
 }
 
 
+def segment_shares(seg_rise, net_rise, have_isp):
+    """Split a rise seen at the far end into what each segment added itself.
+
+    seg_rise holds the rise measured at each hop, and those are cumulative: the
+    rise at the ISP hop includes whatever the Wi-Fi hop already added. Returns
+    {location: amount} in path order, in the same unit as net_rise."""
+    net = max(0.0, net_rise)
+    local = min(max(0.0, seg_rise.get('gateway', 0)), net)
+    if not have_isp or 'isp' not in seg_rise:
+        return {'local': local, 'upstream': net - local}
+    # ISP routers answer probes on a slow path, so their rise can overshoot the far end's
+    isp = min(max(seg_rise['isp'], local), net)
+    return {'local': local, 'access': isp - local, 'beyond': net - isp}
+
+
 def locate(seg_rise, net_rise, have_isp):
-    """Which segment owns most of a rise in latency or loss seen at the far end."""
-    if seg_rise.get('gateway', 0) >= 0.5 * net_rise:
-        return 'local'
-    if not have_isp:
-        return 'upstream'
-    if seg_rise.get('isp', 0) >= 0.5 * net_rise:
-        return 'access'
-    return 'beyond'
+    """Which segment added the most to a rise in latency or loss seen at the far end."""
+    shares = segment_shares(seg_rise, net_rise, have_isp)
+    return max(shares, key=shares.get)  # ties go to the segment nearest this computer
 
 
 def diagnose(stats, phases, wifi, throughput, dest_names, have_isp):
@@ -1295,6 +1305,7 @@ def diagnose(stats, phases, wifi, throughput, dest_names, have_isp):
         if added < 30:
             findings.append(('ok', f'{labels[phase]}: +{fmt_ms(added)} ms under load (grade {letter})', None))
             continue
+        shares = segment_shares(rises(phase), added, have_isp)
         where = locate(rises(phase), added, have_isp)
         level = 'bad' if added >= 200 else 'warn'
         title = f'{labels[phase]}: +{fmt_ms(added)} ms under load (grade {letter})'
@@ -1312,6 +1323,11 @@ def diagnose(stats, phases, wifi, throughput, dest_names, have_isp):
         else:
             detail = (f'The delay builds {LOCATIONS[where]}. Re-test at a different time; '
                       'if it persists, raise it with your ISP.')
+        # a second segment adding a third or more is part of the story, not noise
+        also = [f'{fmt_ms(ms)} ms {LOCATIONS[loc]}' for loc, ms in shares.items()
+                if loc != where and ms >= added / 3]
+        if also:
+            detail += f' Not all of it is there: another {" and ".join(also)}.'
         findings.append((level, title, detail))
 
     worst = None
